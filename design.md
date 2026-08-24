@@ -1,0 +1,166 @@
+# 1B Dense Model \- A Toy Model Training
+
+1. Aiming for **training** a dense 1B parameters model   
+2. Vocabulary V \= 64K (small/medium model)  
+3. Model dimension d \= 2K (very small model)  
+   1. Wembed \= V x d  
+4. User transformer architecture  
+5. Number of layers: L \= 24 layers (small model)  
+6. At each layer  
+   1. Attention  
+      1. Use GQA  
+      2. Number of heads: Hq \= 32  
+      3. Head dimension: Hd \= d/32 \= 2k/32 \= 64  
+      4. Number of KV Hkv \= 4  
+      5. Number of heads/kv \= 32/4 \= 8  
+      6. Wq, Wk, Wv \= d x Hd  
+      7. Wo \= dxd  
+      8. Parameters  
+         1. 2x 2k x 2k \+2 x  4 x 2k x 64= 8M \+ 1M \= 9M  
+      9. **Roughly: 2 x d x d**  
+   2. MLP:   
+      1. Use SwisGLU FFN  
+      2. Dense \- no MoE \- small model  
+      3. Wup \= Wgate \= d x dff, Wdown \= dff x d  
+         1. Dff \= 8/3d  
+      4. Total 8 x d x d \= 8 x 2k x 2k \= 32M  
+      5. **Roughly: 8 x d x d**  
+   3. Output  
+      1. Wunembed \= dxV  
+7. Total number of parameters  
+   1. Wembed \+ L x (2 x d x d \+ 2 x Hkv x d x Hd \+ 8 x d x d) \+ Wunembed  
+      1. 2 x 64K x 2K \+ 24 x (2 x 2K x 2K \+ 2 x 4 x 2K x 64 \+ 8 x 2k x 2k) \= 256M \+ 24 x (9M \+ 32M) \= 1240M \= 1.24B so around 1.24B parameters  
+   2. **Roughly: 2Wd \+ L10d^2**  
+      1. 2 x 64K x 2K \+ 24 x 10 x 2k x 2k \= 256M \+ 960M \= 1.2B  
+8. Train time  
+   1. 8xH100  
+      1. H100: 80GB, 2PFLOPS to train using 16BF  
+      2. Assume MFU \= 0.45  
+      3. Total flops: 8 x 0.45 x 2PF \= 7.2 PF \= 7.2 x 10^15 Flops/s  
+   2. Model training time  
+      1. Flops for static weight:   
+         1. 6 x Nparam x Total tokens F \= 6 x 20 x Nparams^2  
+      2. Flops for attention layer: attention/param  
+         1. 2 x L x T x d/N \= 2 x 24 x 8K x 2K/(1.24x10^9) \= 0.65 or 0.35  
+         2. The actual flops needed is higher  
+      3. Total token  
+         1. 20 x Nparam \= 20 x 1.24B \= around 25B tokens  
+      4. 6 x 20 x (1.24x10^9)^2= 1.84 x 10^20  
+      5. Total \= 1.84 x 10^20/(7.2 x 10^15) x 1.65 \= 25555s x 1.65=  25555 x 1.65 seconds  
+      6. 1 hour \= 60 x 60 seconds  
+      7. 25555 x 1.65 /(60\*60)= 12 hours  
+9. B and T  
+   1. Batch size \- B  
+      1. Start with 1 for now  
+   2. Sequence length \-T  
+      1. Start with 8K  
+10. Memory  
+    1. Include: Static memory: params: weights, vocab, output, optimizer state: gradients, momentum, variance matrixes; and dynamic memory: activation memory.  
+    2. Static memory  
+       1. Memory for params \- all params need fixed memory regardless of batch size or number of tokens being processed at a time \- these process 1 token of size d at a time. Doesn’t depend on input/output size. Only depends on token size d. Not the sequence length T or batch size B.  
+          1. These are: Wembed, Wq,k,v,o, Wup,down,gate, Wunembed  
+             1. There are all 2 bytes each: 1.2B x 2 \= 2.4GB  
+       2. Optimizer state: gradient, momentum and variance matrixes  
+          1. Gradient: 2x parameters: use 2 bytes BP16  
+          2. Momentum: 4x parameters: use FP32  
+          3. Variance: 4x parameters: use FP32  
+          4. Total: 10x parameters  
+             1. 10x 1.2B \= 12GB  
+          5. FP32 master copy của weights 4 x 1.2GB  
+       3. Overall static memory is Nparam x (2bytes \+ 2 bytes \+ 4 bytes \+ 4 bytes \+ 4 bytes) \= Nparam x 16 bytes  
+          1. 19.8GB  
+    3. Dynamic: activation memory: memory needed when making computation: output of computation, memory needed to keep before and after for gradient backward propagation path.  
+       1. Because this is input/output, it depends on the size of input/output  
+       2. Go through RSMNorm  
+          1. B x T x d x 2: x2 because it will need to keep 2 values for before and after for gradient  
+       3. Transformer 1 layer  
+          1. Go through attention layer  
+             1. Q  
+                1. Hq \= 32: B x T x hd x Hq  
+                   1. 8K x 64 x 32 x 2bytes \= 32M  
+             2. K, V:   
+                1. Hkv \= 4: B x T x hd x Hkv x 2 x 2bytes  
+                   1. 8K x 64 x 4 x 4 \= 8M  
+             3. Need to keep 2 copies each way for gradient compute  
+                1. 40M x 2 \= 80M  
+             4. O  
+                1. B x T x d x 2bytes \= 8K x 2k x 2bytes \= 32M  
+             5. Attention score  
+                1. For each head in Hq, for entire batch B, we have Qh x Vkv which is T x T  
+                   1. Qh \= \[B x T x d\] \[d x Hd\] \= \[B x T x Hd\]  
+                   2. Vkv \= \[B x T x d\]\[d x Hd\] \= \[B x T x Hd\]  
+                   3. Qh x transpose(Vkv) \= B x T x T  
+                2. Hq x B x T x T x 2 bytes  
+                3. Use FlashAttention3 to get to 0 bytes  
+          2. Go through MLP layer  
+             1. Up, Down, Gate  
+                1. B x T x dff x 3 x 2bytes= 8K x 8/3 x 2k x 3 x 2bytes \= 256MB  
+       4. Transformer 24 layers  
+          1. 24 x (32M \+ 8M \+ 32M \+ 256M) \= 24 x 328M \= 7.872GB  
+    4. Total memory  
+       1. 2.4GB \+ 12 GB \+ 7.8GB \= 22.2GB   
+    5. 22.2GB, fit easily into 80GB, effective memory to use 72GB  
+       1. So we can get B \= (72 \- 2.4 \- 12)/7.872= 7.3, choosing B \= 4  
+11. Number of steps  
+    1. Total number of tokens/token per iteration  
+       1. 25B/(B x T x DDP) \= 25 x 10^9 /(4 x 8 x 10^3 x 8\) \= 97K steps  
+       2. Time per step: 12 hours/97K \= 0.44 s/step  
+       3. Tokens/step \= 25B/97K \= 257K token/step  
+12. Scaling/Architecture/Geometry  
+    1. We need input of 25B token  
+    2. This go to a cluster of 8GPU H100  
+    3. Model has 24 layers  
+    4. They are split into rounds, each round  
+       1. 4 batches \- Data Parallel param DP \= 4  
+          1. 8GPU \=\> 2 GPU will handle 1 batch  
+             1. 2 GPU will handle 1 copy of the model: PP \= 2  
+          2. 8 GPU handles 4 copies of model, they need to sync in the backward step  
+       2. 24 layers divided by 2 GPU  
+          1. 1st GPU is 12 layers 0 \-11  
+          2. 2nd GPU is 12 layers 12 \- 23  
+       3. 8K length of sequence  
+          1. 8K goes to 1st GPU with 12 layers, then 2nd GPU with 12 layers  
+    5. Bubble handling  
+       1. Split into 8 mini batch: 1K each  
+    6. We can also try DP \= 8, PP \= 1  
+13. Others  
+    1. Norm: using RMSNorm  
+    2. Mixed precision: BF16  
+    3. Use RoPE  
+14. Software stack  
+    1. Use Pytorch with DP \= 8 first  
+    2. Use Megatron-LM/Deepspeed with PP \= 2 DP \= 4 second  
+15. Pre-run check  
+    1. Expected Initial Loss \= \-ln(1/V) \= \-ln(1/64K) \= 11  
+       1. Should be around that.   
+16. Check point strategy  
+    1. Checkpoint Strategy: Saving 15GB (weights \+ optimizer) every N steps asynchronously to NVMe storage so your GPU compute isn't blocked during disk I/O.  
+17. Pre-tokenize  
+    1. Vocab: 64K token   
+       1. Each token has an index of 2 bytes.  
+       2. Each token is initialized as random vector of 8K  
+    2. We have 25B token, pretokenzie them, store in disk   
+       1. Each token is mapped to an index using 2 bytes  
+       2. 25B x 2bytes \= 50GB of token  
+    3. Input: “Here is an example text”  
+       1. Convert into tokens using BPE: Token2Token4Token6 etc.  
+       2. In the disk we store their index only e.g: 246  
+       3. When it reads from disk: it read 2 \=\> token 2  
+       4. Pass it to GPU \[B x T\]  
+       5. GPU then load into Wembed when it needs it \- right before the first RSMNorm  
+18. Sequence packing  
+    1. Read the data sources (txt)  
+    2. Mixed them from sources to get to text that worth 25B token  
+       1. 1 token \= 4 characters  
+       2. 25B tokens \= 100B characters or 100GB  
+       3. Pass them through a tokenizer get 50GB of data  
+          1. 50GB/2bytes \= 25G of id  
+       4. Package them into packets of size 8K token ids  
+19. Implementation  
+    1. Data  
+       1. Data source  
+       2. How to load, split data  
+    2. Machine  
+       1. Allocate GPUs  
+       2. Execute and check the performance  
+       3. Validate metrics, benchmarking
