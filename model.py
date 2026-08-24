@@ -62,13 +62,12 @@ def apply_rotary_emb(
     freqs_cis = freqs_cis[:seqlen]
 
     # Apply RoPE to query and key tensors
-    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:1], -1, 2))
-    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:1], -1, 2))
+    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
 
-    freqs_cis = freqs_cis.unsqueeze(0).unsqueeze(2)
-
-    xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_complex * freqs_cis).flatten(3)
+    freqs_cis_slice = freqs_cis[:seqlen].unsqueeze(0).unsqueeze(2)
+    xq_out = torch.view_as_real(xq_complex * freqs_cis_slice).flatten(3)
+    xk_out = torch.view_as_real(xk_complex * freqs_cis_slice).flatten(3)
 
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
@@ -88,9 +87,8 @@ class FeedForward(nn.Module):
         self.wup = nn.Linear(config.d_model, hidden_dim, bias=False)
         self.wdown = nn.Linear(hidden_dim, config.d_model, bias=False)
 
-    def foward(self, x: torch.Tensor) -> torch.Tensor:
-        # SwiGLU: wup(SiLU(wgate(x)) * wdown(x))
-        return self.wup(F.silu(self.wgate(x))) * self.wdown(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.wdown(F.silu(self.wgate(x)) * self.wup(x))
 
 # ==============================================================================
 # 5. GROUPED-QUERY ATTENTION (GQA) WITH FLASH ATTENTION
@@ -100,7 +98,7 @@ class GroupQueryAttention(nn.Module):
         super().__init__()
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads
-        self.n_rep = config.n_heads
+        self.n_rep = config.n_heads // config.n_kv_heads
         self.head_dim = config.head_dim
 
         self.wq = nn.Linear(config.d_model, config.n_heads * config.head_dim, bias=False)
@@ -111,13 +109,10 @@ class GroupQueryAttention(nn.Module):
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
 
-        #1. Linear projection
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
-        #2. Reshape
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-        kv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        # Reshape
+        xq = self.wq(x).view(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        xv = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
         # Apply RoPE
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
@@ -130,7 +125,7 @@ class GroupQueryAttention(nn.Module):
         # Transpose 
         xq = xq.transpose(1, 2)
         xk = xk.transpose(1, 2)
-        xv = xv.transponse(1, 2)
+        xv = xv.transpose(1, 2)
 
         # use FlashAttention 2
         output = F.scaled_dot_product_attention(
@@ -140,14 +135,14 @@ class GroupQueryAttention(nn.Module):
             is_causal=True
         )
 
-        output = output.transpose(1, 2).contingous().view(bsz, seqlen, -1)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
 # ==============================================================================
 # 6. TRANSFORMER BLOCK
 # ==============================================================================
 class TransformerBlock(nn.Module):
-    def __init__(self, config: Module.Config):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.attention = GroupQueryAttention(config)
         self.feed_forward = FeedForward(config)
@@ -157,7 +152,7 @@ class TransformerBlock(nn.Module):
     def forward(self, x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
         # Pre-Normalization Architecture
         h = x + self.attention(self.attention_norm(x), freqs_cis)
-        output = h + self.feedforward(self.ffn_norm(h));
+        output = h + self.feed_forward(self.ffn_norm(h));
         return output
 
 # ==============================================================================
@@ -195,14 +190,14 @@ class Transformer1B(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, tokens: torch.Tensor, targets: Optiona[torch.Tensor] = None):
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        freq_cis = self.freqs_cis[:seqlen]
+        freqs_cis = self.freqs_cis[:seqlen]
 
         # Forward through 24 Transformer Blocks
         for layer in self.layers:
-            h = layer(h, self.freqs_cis)
+            h = layer(h, freqs_cis)
 
         h = self.norm(h)
 
@@ -245,9 +240,13 @@ if __name__ == "__main__":
     dummy_y = torch.randint(0, config.vocab_size, (2, 512), device=device)
 
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
-    with torch.autocast(device_type=device, dtype=dtype):
-        logits, loss = model(dummy_x, dummy_y)
 
+    if device == "cuda":
+        with torch.autocast(device_type=device, dtype=dtype):
+            logits, loss = model(dummy_x, dummy_y)
+    else:
+        logits, loss = model(dummy_x, dummy_y)
+    
     print(f"  - Output Logits Shape: {logits.shape}")
     print(f"  - Sample Loss Value  : {loss.item():.4f}")
     print(f"  - Initial Loss: ln({config.vocab_size}) = {math.log(config.vocab_size):.2f}")
