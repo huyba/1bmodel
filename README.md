@@ -15,7 +15,7 @@ The full architecture, parameter count, and memory/throughput derivation live in
 | [prepare_data_local.py](prepare_data_local.py) | Tokenizes local parquet files and packs them into a single binary token shard |
 | [prepare_data_multiprocess.py](prepare_data_multiprocess.py) | Same idea, parallelized across CPU cores for faster tokenization |
 | [prepare_data.py](prepare_data.py) | Alternative: streams FineWeb-Edu directly from the Hub (no local parquet download needed) and packs on the fly |
-| [design.md](design.md) / [design.txt](design.txt) | Architecture, parameter count, and memory/throughput design notes |
+| [design.md](design.md) | Architecture, parameter count, and memory/throughput design notes |
 
 ## Requirements
 
