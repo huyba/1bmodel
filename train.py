@@ -179,7 +179,6 @@ def train():
 
             is_last_micro_step = (micro_step == args.grad_accum_steps - 1)
             
-            # FIX 1: Use model.no_sync() instead of torch.no_sync()
             if ddp and not is_last_micro_step:
                 ctx = model.no_sync()
             else:
@@ -194,7 +193,6 @@ def train():
 
                 # Scale loss for gradient accumulation
                 loss = loss / args.grad_accum_steps
-                # FIX 2: Accumulate unscaled loss for accurate logging
                 loss_accum += loss.detach() * args.grad_accum_steps
                 loss.backward()
 
