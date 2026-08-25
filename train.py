@@ -75,7 +75,8 @@ def train():
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="1bmodel-pretrain")
-    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                         help="Defaults to run-YYYY-MM-DD-HH-MM-SS (start time) if not set")
     parser.add_argument("--wandb_log_interval", type=int, default=10, help="Log to W&B every N steps")
     args = parser.parse_args()
 
@@ -132,9 +133,10 @@ def train():
         print("-" * 70)
 
     if master_process and args.wandb:
+        run_name = args.wandb_run_name or time.strftime("run-%Y-%m-%d-%H-%M-%S")
         wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run_name,
+            name=run_name,
             config={
                 "learning_rate": args.max_lr,
                 "min_lr": args.min_lr,
