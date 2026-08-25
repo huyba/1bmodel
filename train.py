@@ -15,9 +15,15 @@ from model import Transformer1B, ModelConfig
 from dataset import PretrainBinaryDataset
 
 
-def _async_save_worker(checkpoint_data, save_path):
-    torch.save(checkpoint_data, save_path)
-    print(f"\n✅ [Async Checkpoint] Saved to: {save_path}\n")
+def _async_save_worker(checkpoint_data, save_path, result):
+    try:
+        torch.save(checkpoint_data, save_path)
+        result['ok'] = True
+        print(f"\n✅ [Async Checkpoint] Saved to: {save_path}\n")
+    except Exception as e:
+        result['ok'] = False
+        result['error'] = e
+        print(f"\n❌ [Async Checkpoint] FAILED to save {save_path}: {e}\n")
 
 
 def async_save_checkpoint(checkpoint_data, save_path):
@@ -26,8 +32,19 @@ def async_save_checkpoint(checkpoint_data, save_path):
         for k, v in checkpoint_data['model_state_dict'].items()
     }
     checkpoint_data['model_state_dict'] = cpu_state_dict
-    thread = threading.Thread(target=_async_save_worker, args=(checkpoint_data, save_path))
+    result = {}
+    thread = threading.Thread(target=_async_save_worker, args=(checkpoint_data, save_path, result))
+    thread.result = result
     thread.start()
+    return thread
+
+
+def _check_save_ok(thread, label):
+    """Join a checkpoint-save thread and raise loudly if the write failed
+    (Thread.join() alone swallows exceptions raised inside the thread)."""
+    thread.join()
+    if not thread.result.get('ok'):
+        raise RuntimeError(f"{label} checkpoint failed to save: {thread.result.get('error')}")
 
 
 def get_lr(it, warmup_steps, max_steps, max_lr, min_lr):
@@ -52,6 +69,8 @@ def train():
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--max_lr", type=float, default=3e-4)
     parser.add_argument("--min_lr", type=float, default=3e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--save_interval", type=int, default=500, help="Save a checkpoint every N steps")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
     args = parser.parse_args()
 
@@ -117,8 +136,15 @@ def train():
             print("🚀 Compiling model with torch.compile...")
         model = torch.compile(model)
 
+    # Only apply weight decay to matmul-participating weights (ndim >= 2).
+    # RMSNorm scale params (ndim == 1) are excluded to avoid decaying them toward zero.
+    decay_params = [p for p in raw_model.parameters() if p.requires_grad and p.dim() >= 2]
+    no_decay_params = [p for p in raw_model.parameters() if p.requires_grad and p.dim() < 2]
     optimizer = torch.optim.AdamW(
-        raw_model.parameters(),
+        [
+            {'params': decay_params, 'weight_decay': args.weight_decay},
+            {'params': no_decay_params, 'weight_decay': 0.0},
+        ],
         lr=args.max_lr,
         betas=(0.9, 0.95),
         eps=1e-8,
@@ -154,6 +180,8 @@ def train():
     model.train()
     if master_process:
         print("🚀 Starting training pipeline...")
+
+    pending_save_thread = None
 
     for step in range(1, args.max_steps + 1):
         t0 = time.time()
@@ -219,13 +247,24 @@ def train():
                 f"Throughput: {tokens_per_sec:.0f} tok/s"
             )
 
-    # 3. Save Checkpoint
+        if master_process and step % args.save_interval == 0:
+            if pending_save_thread is not None:
+                _check_save_ok(pending_save_thread, "Periodic")
+            save_path = os.path.join(args.out_dir, "model_latest.pt")
+            ckpt = {'model_state_dict': raw_model.state_dict(), 'config': asdict(config), 'step': step}
+            print(f"\n💾 [Step {step}] Saving periodic checkpoint...")
+            pending_save_thread = async_save_checkpoint(ckpt, save_path)
+
+    # 3. Save Final Checkpoint
     if master_process:
-        print("\n💾 Saving Checkpoint...")
+        if pending_save_thread is not None:
+            _check_save_ok(pending_save_thread, "Periodic")
+        print("\n💾 Saving final checkpoint...")
         save_path = os.path.join(args.out_dir, "model_final.pt")
         ckpt = {'model_state_dict': raw_model.state_dict(), 'config': asdict(config), 'step': args.max_steps}
-        async_save_checkpoint(ckpt, save_path)
-        time.sleep(1)
+        save_thread = async_save_checkpoint(ckpt, save_path)
+        print("⏳ Waiting for final checkpoint to finish writing to disk...")
+        _check_save_ok(save_thread, "Final")
         print("🎉 TRAINING PIPELINE COMPLETED SUCCESSFULLY!")
 
     if ddp:
