@@ -7,6 +7,7 @@ from dataclasses import asdict
 
 import torch
 import torch.nn.functional as F
+import wandb
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
@@ -72,6 +73,10 @@ def train():
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--save_interval", type=int, default=500, help="Save a checkpoint every N steps")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
+    parser.add_argument("--wandb_project", type=str, default="1bmodel-pretrain")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_log_interval", type=int, default=10, help="Log to W&B every N steps")
     args = parser.parse_args()
 
     # Device setup
@@ -125,6 +130,24 @@ def train():
         print(f"  - Grad Accum Steps: {args.grad_accum_steps}")
         print(f"  - Expected Loss   : {expected_loss:.4f}")
         print("-" * 70)
+
+    if master_process and args.wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "learning_rate": args.max_lr,
+                "min_lr": args.min_lr,
+                "weight_decay": args.weight_decay,
+                "batch_size": args.batch_size,
+                "grad_accum_steps": args.grad_accum_steps,
+                "seq_len": args.seq_len,
+                "max_steps": args.max_steps,
+                "warmup_steps": args.warmup_steps,
+                "world_size": world_size,
+                "model_params": f"{n_params / 1e9:.2f}B",
+            }
+        )
 
     if ddp:
         model = DDP(model, device_ids=[int(os.environ['LOCAL_RANK'])])
@@ -247,6 +270,14 @@ def train():
                 f"Throughput: {tokens_per_sec:.0f} tok/s"
             )
 
+        if master_process and args.wandb and step % args.wandb_log_interval == 0:
+            wandb.log({
+                "train/loss": loss_log,
+                "train/lr": lr,
+                "train/grad_norm": grad_norm.item(),
+                "perf/tokens_per_sec": tokens_per_sec,
+            }, step=step)
+
         if master_process and step % args.save_interval == 0:
             if pending_save_thread is not None:
                 _check_save_ok(pending_save_thread, "Periodic")
@@ -266,6 +297,9 @@ def train():
         print("⏳ Waiting for final checkpoint to finish writing to disk...")
         _check_save_ok(save_thread, "Final")
         print("🎉 TRAINING PIPELINE COMPLETED SUCCESSFULLY!")
+
+    if master_process and args.wandb:
+        wandb.finish()
 
     if ddp:
         dist.destroy_process_group()

@@ -37,7 +37,7 @@ hf auth login
 bash download_script.bash
 ```
 
-This pulls all `*.parquet` shards of `HuggingFaceFW/fineweb-edu` into `./fineweb_raw/`. It's a large download — check available disk space first (the full packed token shard alone is ~50GB; see step 2).
+This pulls a ~86GB slice (`sample/100BT` groups 000-003, ~28.6B raw tokens — comfortable headroom over the 25B-token target) of `HuggingFaceFW/fineweb-edu` into `./fineweb_raw/`, rather than the full dataset. See the comments in [download_script.bash](download_script.bash) for the disk-space math behind that choice. Check available space before running it either way — the packed token shard alone is ~50GB and needs to coexist on disk with the parquet download during packing (see step 2).
 
 ## 2. Tokenize and pack into a binary shard
 
