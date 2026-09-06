@@ -27,12 +27,27 @@ def _async_save_worker(checkpoint_data, save_path, result):
         print(f"\n❌ [Async Checkpoint] FAILED to save {save_path}: {e}\n")
 
 
+def _to_cpu_clone(obj):
+    """Recursively move tensors to CPU inside (possibly nested) dicts/lists —
+    optimizer state_dicts nest tensors under {'state': {idx: {...}}, 'param_groups': [...]}.
+    .cpu() on a non-CPU tensor already allocates an independent copy (crossing a
+    device boundary always copies), so only actually-on-CPU tensors need an
+    explicit .clone() to decouple them from the live training tensors. Skipping
+    the redundant double-copy roughly halves peak memory during checkpointing —
+    which matters: with optimizer state included this can be ~3x model size."""
+    if isinstance(obj, torch.Tensor):
+        return obj.clone() if obj.device.type == 'cpu' else obj.cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu_clone(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu_clone(v) for v in obj]
+    return obj
+
+
 def async_save_checkpoint(checkpoint_data, save_path):
-    cpu_state_dict = {
-        k: v.cpu().clone() if isinstance(v, torch.Tensor) else v
-        for k, v in checkpoint_data['model_state_dict'].items()
-    }
-    checkpoint_data['model_state_dict'] = cpu_state_dict
+    checkpoint_data['model_state_dict'] = _to_cpu_clone(checkpoint_data['model_state_dict'])
+    if 'optimizer_state_dict' in checkpoint_data:
+        checkpoint_data['optimizer_state_dict'] = _to_cpu_clone(checkpoint_data['optimizer_state_dict'])
     result = {}
     thread = threading.Thread(target=_async_save_worker, args=(checkpoint_data, save_path, result))
     thread.result = result
@@ -72,6 +87,8 @@ def train():
     parser.add_argument("--min_lr", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--save_interval", type=int, default=500, help="Save a checkpoint every N steps")
+    parser.add_argument("--resume_from", type=str, default=None,
+                         help="Path to a checkpoint to resume model + optimizer + step from")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="1bmodel-pretrain")
@@ -190,6 +207,21 @@ def train():
             assert abs(init_loss.item() - expected_loss) < 1.5, "Initial Loss mismatch!"
             print("  -> Initial Loss CHECK PASSED!\n")
 
+    # Resume from checkpoint (after the sanity check above, so it still validates a
+    # fresh init) — restores model + optimizer state, and continues the step/LR
+    # schedule from where it left off. Note: the data iterator itself restarts from
+    # the beginning of the dataset rather than resuming an exact mid-epoch position.
+    start_step = 1
+    if args.resume_from:
+        if master_process:
+            print(f"📂 Resuming from checkpoint: {args.resume_from}")
+        resume_ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        raw_model.load_state_dict(resume_ckpt['model_state_dict'])
+        optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
+        start_step = resume_ckpt['step'] + 1
+        if master_process:
+            print(f"   -> Resumed at step {resume_ckpt['step']}, continuing from step {start_step}\n")
+
     # 2. Dataset & DataLoader Setup
     # PretrainBinaryDataset shards itself across ranks/workers inside __iter__,
     # so no sampler is used (and none would work: it's an IterableDataset).
@@ -208,7 +240,7 @@ def train():
 
     pending_save_thread = None
 
-    for step in range(1, args.max_steps + 1):
+    for step in range(start_step, args.max_steps + 1):
         t0 = time.time()
         
         lr = get_lr(step, args.warmup_steps, args.max_steps, args.max_lr, args.min_lr)
@@ -284,7 +316,12 @@ def train():
             if pending_save_thread is not None:
                 _check_save_ok(pending_save_thread, "Periodic")
             save_path = os.path.join(args.out_dir, "model_latest.pt")
-            ckpt = {'model_state_dict': raw_model.state_dict(), 'config': asdict(config), 'step': step}
+            ckpt = {
+                'model_state_dict': raw_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': asdict(config),
+                'step': step,
+            }
             print(f"\n💾 [Step {step}] Saving periodic checkpoint...")
             pending_save_thread = async_save_checkpoint(ckpt, save_path)
 
@@ -294,7 +331,12 @@ def train():
             _check_save_ok(pending_save_thread, "Periodic")
         print("\n💾 Saving final checkpoint...")
         save_path = os.path.join(args.out_dir, "model_final.pt")
-        ckpt = {'model_state_dict': raw_model.state_dict(), 'config': asdict(config), 'step': args.max_steps}
+        ckpt = {
+            'model_state_dict': raw_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': asdict(config),
+            'step': args.max_steps,
+        }
         save_thread = async_save_checkpoint(ckpt, save_path)
         print("⏳ Waiting for final checkpoint to finish writing to disk...")
         _check_save_ok(save_thread, "Final")
