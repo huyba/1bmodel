@@ -271,8 +271,58 @@ Pass criteria: `DEVICE: CUDA` (not CPU/MPS) printed at startup, `Initial Loss CH
 
 Delete test checkpoints (`rm -rf ckpt_test ckpt_test2 ckpt_auto`) before moving to the real run — at ~13-14GB each (model + optimizer state, fp32), they add up fast against a VM's boot disk.
 
+### Validated on real H100 hardware
+
+The full pipeline above (environment, training loop, checkpoint save, `--resume_from`, `--auto_resume` + `--gcs_bucket` round trip, `--wandb`) was re-run end to end on an actual `a3-highgpu-1g` (1× H100 80GB) preemptible VM — not just the L4 used for the cheaper smoke tests — to confirm nothing about this specific GPU generation breaks the pipeline. A real W&B run (5 steps, toy config) confirms logging works on real GCP infra, not just locally:
+
+<p float="left">
+  <img src="docs/images/wandb-h100-perf.png" width="45%" alt="W&B perf/tokens_per_sec chart from the H100 validation run" />
+  <img src="docs/images/wandb-h100-train.png" width="45%" alt="W&B train/lr, train/loss, train/grad_norm charts from the H100 validation run" />
+</p>
+
+Throughput climbs to ~2,700-2,800 tok/s after the first (warmup/kernel-compile) step — for comparison, the same toy config on an L4 topped out around ~1,200 tok/s. `train/lr` follows the expected cosine decay, `train/loss` and `train/grad_norm` are just noise at this scale (5 steps on a randomly-initialized model isn't enough to show real learning — this run validates plumbing, not convergence).
+
+Only single-GPU has been validated this way — real multi-GPU DDP (`torchrun --nproc_per_node=2+`) is still unverified, blocked by this project's `GPUS_ALL_REGIONS` quota (see below).
+
 ### Preemptible/Spot: what actually happens on preemption
 
 GCP stops (not deletes) a preempted VM — the boot disk and its local checkpoints survive. But nothing restarts it or re-launches training automatically. Without further setup, recovering means: notice it stopped → `gcloud compute instances start` it yourself → SSH in → re-run `train.py --auto_resume ...` yourself. `--auto_resume` makes that last step safe and mindless (no need to track which checkpoint or where), but doesn't eliminate the manual restart.
 
-For fully hands-off recovery, the standard GCP pattern is a **Managed Instance Group** with target size 1, built from an instance template whose `startup-script` runs the training command (with `--auto_resume --gcs_bucket ...`) on every boot. When preempted, the MIG detects it and creates a *replacement* VM from the template — a fresh disk with no local checkpoint, which is exactly the case `--auto_resume`'s GCS fallback exists for. This isn't set up in this repo yet; it's the next piece needed before an unattended multi-day preemptible run.
+For fully hands-off recovery, the standard GCP pattern is a **Managed Instance Group (MIG)** with target size 1, built from an instance template whose `startup-script` runs the training command (with `--auto_resume --gcs_bucket ...`) on every boot. When preempted, the MIG detects it and creates a *replacement* VM from the template — a fresh disk with no local checkpoint, which is exactly the case `--auto_resume`'s GCS fallback exists for.
+
+```bash
+# Secrets that can't live in git go in the same bucket instead, pulled by the startup-script:
+gcloud storage cp .env gs://your-bucket/secrets/.env
+
+# Instance template: same VM config as above, plus a startup-script (see below)
+gcloud compute instance-templates create my-train-template \
+  --machine-type=a3-highgpu-1g \
+  --image-family=pytorch-2-9-cu129-ubuntu-2204-nvidia-580 \
+  --image-project=deeplearning-platform-release \
+  --boot-disk-size=200GB \
+  --maintenance-policy=TERMINATE \
+  --provisioning-model=SPOT \
+  --instance-termination-action=STOP \
+  --metadata="install-nvidia-driver=True" \
+  --metadata-from-file=startup-script=startup-script.sh \
+  --service-account=<PROJECT_NUMBER>-compute@developer.gserviceaccount.com \
+  --scopes=https://www.googleapis.com/auth/devstorage.read_write,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write
+
+# Regional MIG (spans multiple zones) beats a zonal one: a single zone can be
+# capacity-constrained (ZONE_RESOURCE_POOL_EXHAUSTED — not a quota error, just
+# no H100s free there right now) even when the region overall has quota and stock.
+gcloud compute instance-groups managed create my-train-mig \
+  --base-instance-name=my-train \
+  --template=my-train-template \
+  --size=1 \
+  --region=us-west1 \
+  --zones=us-west1-a,us-west1-b
+```
+
+`startup-script.sh` does everything a manual setup would (idempotently, since it runs on every boot including replacement instances): re-arm swap, `git pull` the repo, install deps, pull `.env` and the packed dataset from GCS, then launch `train.py` with `--auto_resume --gcs_bucket ... --wandb`. `--provisioning-model=SPOT --instance-termination-action=STOP` is the instance-template-level equivalent of the standalone `--preemptible` flag used elsewhere in this doc — same quota bucket, just the API surface MIGs expect.
+
+Check MIG health with:
+```bash
+gcloud compute instance-groups managed list-instances my-train-mig --region=us-west1
+gcloud compute instance-groups managed list-errors my-train-mig --region=us-west1
+```
