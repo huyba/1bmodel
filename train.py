@@ -3,6 +3,7 @@ import math
 import time
 import argparse
 import threading
+import subprocess
 from dataclasses import asdict
 
 import torch
@@ -16,7 +17,7 @@ from model import Transformer1B, ModelConfig
 from dataset import PretrainBinaryDataset
 
 
-def _async_save_worker(checkpoint_data, save_path, result):
+def _async_save_worker(checkpoint_data, save_path, result, gcs_dest=None):
     try:
         torch.save(checkpoint_data, save_path)
         result['ok'] = True
@@ -25,6 +26,21 @@ def _async_save_worker(checkpoint_data, save_path, result):
         result['ok'] = False
         result['error'] = e
         print(f"\n❌ [Async Checkpoint] FAILED to save {save_path}: {e}\n")
+        return  # local save failed — nothing valid to upload
+
+    if gcs_dest:
+        # Runs in this same background thread so the upload doesn't block training
+        # either. A failed upload does NOT fail the checkpoint overall (result['ok']
+        # stays True) — the local file is already safe; this is a best-effort backup.
+        try:
+            subprocess.run(
+                ["gcloud", "storage", "cp", save_path, gcs_dest],
+                check=True, capture_output=True, text=True,
+            )
+            print(f"\n☁️  [GCS Upload] Uploaded to: {gcs_dest}\n")
+        except Exception as e:
+            detail = e.stderr if isinstance(e, subprocess.CalledProcessError) else str(e)
+            print(f"\n⚠️  [GCS Upload] FAILED to upload {save_path} to {gcs_dest}: {detail}\n")
 
 
 def _to_cpu_clone(obj):
@@ -44,12 +60,12 @@ def _to_cpu_clone(obj):
     return obj
 
 
-def async_save_checkpoint(checkpoint_data, save_path):
+def async_save_checkpoint(checkpoint_data, save_path, gcs_dest=None):
     checkpoint_data['model_state_dict'] = _to_cpu_clone(checkpoint_data['model_state_dict'])
     if 'optimizer_state_dict' in checkpoint_data:
         checkpoint_data['optimizer_state_dict'] = _to_cpu_clone(checkpoint_data['optimizer_state_dict'])
     result = {}
-    thread = threading.Thread(target=_async_save_worker, args=(checkpoint_data, save_path, result))
+    thread = threading.Thread(target=_async_save_worker, args=(checkpoint_data, save_path, result, gcs_dest))
     thread.result = result
     thread.start()
     return thread
@@ -89,6 +105,14 @@ def train():
     parser.add_argument("--save_interval", type=int, default=500, help="Save a checkpoint every N steps")
     parser.add_argument("--resume_from", type=str, default=None,
                          help="Path to a checkpoint to resume model + optimizer + step from")
+    parser.add_argument("--gcs_bucket", type=str, default=None,
+                         help="If set (e.g. gs://bucket/checkpoints), upload each checkpoint there "
+                              "via `gcloud storage cp` right after it saves locally")
+    parser.add_argument("--auto_resume", action="store_true",
+                         help="If --resume_from isn't given, look for out_dir/model_latest.pt "
+                              "locally first, then gs://<gcs_bucket>/model_latest.pt if not found "
+                              "locally, and resume from whichever turns up (starts fresh if neither "
+                              "exists — meant for restarting on a fresh VM after preemption)")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
     parser.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     parser.add_argument("--wandb_project", type=str, default="1bmodel-pretrain")
@@ -211,16 +235,48 @@ def train():
     # fresh init) — restores model + optimizer state, and continues the step/LR
     # schedule from where it left off. Note: the data iterator itself restarts from
     # the beginning of the dataset rather than resuming an exact mid-epoch position.
+    resume_path = args.resume_from
+    if resume_path is None and args.auto_resume:
+        local_latest = os.path.join(args.out_dir, "model_latest.pt")
+        if os.path.exists(local_latest):
+            resume_path = local_latest
+            if master_process:
+                print(f"🔎 --auto_resume: found local checkpoint at {resume_path}")
+        elif args.gcs_bucket:
+            gcs_latest = f"{args.gcs_bucket.rstrip('/')}/model_latest.pt"
+            if master_process:
+                print(f"🔎 --auto_resume: no local checkpoint, trying {gcs_latest} ...")
+                try:
+                    subprocess.run(["gcloud", "storage", "cp", gcs_latest, local_latest],
+                                    check=True, capture_output=True, text=True)
+                    print(f"   -> downloaded from GCS\n")
+                except Exception as e:
+                    detail = e.stderr if isinstance(e, subprocess.CalledProcessError) else str(e)
+                    print(f"   -> nothing found on GCS either ({detail.strip()}); starting fresh\n")
+            # One rank downloads; the rest wait so they don't race on the same file.
+            if ddp:
+                dist.barrier()
+            if os.path.exists(local_latest):
+                resume_path = local_latest
+
     start_step = 1
-    if args.resume_from:
+    if resume_path:
         if master_process:
-            print(f"📂 Resuming from checkpoint: {args.resume_from}")
-        resume_ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+            print(f"📂 Resuming from checkpoint: {resume_path}")
+        # Load to CPU, not `device`: model/optimizer .load_state_dict() already cast
+        # and move each tensor to the right device on their own. Loading straight to
+        # GPU would leave the now-redundant loaded tensors (~model size) referenced
+        # by resume_ckpt and stranded in VRAM for the rest of training, on top of
+        # the model's own real footprint — enough to OOM a memory-constrained GPU.
+        resume_ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
         raw_model.load_state_dict(resume_ckpt['model_state_dict'])
         optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
         start_step = resume_ckpt['step'] + 1
         if master_process:
             print(f"   -> Resumed at step {resume_ckpt['step']}, continuing from step {start_step}\n")
+        del resume_ckpt
+        if use_cuda:
+            torch.cuda.empty_cache()
 
     # 2. Dataset & DataLoader Setup
     # PretrainBinaryDataset shards itself across ranks/workers inside __iter__,
@@ -323,7 +379,8 @@ def train():
                 'step': step,
             }
             print(f"\n💾 [Step {step}] Saving periodic checkpoint...")
-            pending_save_thread = async_save_checkpoint(ckpt, save_path)
+            gcs_dest = f"{args.gcs_bucket.rstrip('/')}/model_latest.pt" if args.gcs_bucket else None
+            pending_save_thread = async_save_checkpoint(ckpt, save_path, gcs_dest)
 
     # 3. Save Final Checkpoint
     if master_process:
@@ -337,7 +394,8 @@ def train():
             'config': asdict(config),
             'step': args.max_steps,
         }
-        save_thread = async_save_checkpoint(ckpt, save_path)
+        gcs_dest = f"{args.gcs_bucket.rstrip('/')}/model_final.pt" if args.gcs_bucket else None
+        save_thread = async_save_checkpoint(ckpt, save_path, gcs_dest)
         print("⏳ Waiting for final checkpoint to finish writing to disk...")
         _check_save_ok(save_thread, "Final")
         print("🎉 TRAINING PIPELINE COMPLETED SUCCESSFULLY!")
