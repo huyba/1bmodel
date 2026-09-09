@@ -90,6 +90,36 @@ def get_lr(it, warmup_steps, max_steps, max_lr, min_lr):
     return min_lr + coeff * (max_lr - min_lr)
 
 
+# Peak bf16 dense (no sparsity) TFLOPS — matches how this model actually runs
+# (autocast bf16, no structured sparsity). Extend as new GPUs get used.
+_KNOWN_GPU_PEAK_BF16_TFLOPS = {
+    "H100": 989.0,
+    "A100": 312.0,
+}
+
+
+def detect_gpu_peak_tflops(override=None):
+    if override is not None:
+        return override
+    if not torch.cuda.is_available():
+        return None
+    name = torch.cuda.get_device_name()
+    for key, tflops in _KNOWN_GPU_PEAK_BF16_TFLOPS.items():
+        if key in name:
+            return tflops
+    return None  # unknown GPU: MFU just won't be computed/logged
+
+
+def compute_mfu(n_params, tokens_per_sec, gpu_peak_tflops):
+    """MFU = achieved FLOPs/s ÷ peak FLOPs/s. Achieved FLOPs/s uses the
+    standard 6N-per-token approximation (2N fwd + 4N bwd) from the
+    Chinchilla/PaLM papers — ignores attention's own FLOPs, fine as an estimate."""
+    if gpu_peak_tflops is None:
+        return None
+    achieved_flops = 6 * n_params * tokens_per_sec
+    return achieved_flops / (gpu_peak_tflops * 1e12)
+
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="./dummy_data")
@@ -119,6 +149,10 @@ def train():
     parser.add_argument("--wandb_run_name", type=str, default=None,
                          help="Defaults to run-YYYY-MM-DD-HH-MM-SS (start time) if not set")
     parser.add_argument("--wandb_log_interval", type=int, default=10, help="Log to W&B every N steps")
+    parser.add_argument("--gpu_peak_tflops", type=float, default=None,
+                         help="Peak bf16 dense TFLOPS for MFU calc. Auto-detected for "
+                              "H100/A100 from the GPU name if not set; MFU is skipped "
+                              "if the GPU isn't recognized and this isn't provided.")
     args = parser.parse_args()
 
     # Device setup
@@ -145,6 +179,7 @@ def train():
         world_size = 1
 
     use_cuda = device.startswith('cuda')
+    gpu_peak_tflops = detect_gpu_peak_tflops(args.gpu_peak_tflops)
 
     tokens_per_iter = args.batch_size * args.seq_len * args.grad_accum_steps * world_size
 
@@ -153,6 +188,10 @@ def train():
         print("=" * 70)
         print(f"🖥️  DEVICE: {device.upper()} | WORLD SIZE: {world_size}")
         print(f"📦 GLOBAL BATCH SIZE: {tokens_per_iter:,} tokens/step")
+        if use_cuda:
+            gpu_name = torch.cuda.get_device_name()
+            tflops_str = f"{gpu_peak_tflops:.0f} TFLOPS bf16" if gpu_peak_tflops else "unknown, MFU disabled"
+            print(f"🎮 GPU: {gpu_name} | Peak: {tflops_str}")
         print("=" * 70)
 
     config = ModelConfig(
@@ -349,8 +388,11 @@ def train():
         t1 = time.time()
         dt = t1 - t0
         tokens_per_sec = tokens_per_iter / dt
+        # n_params is only assigned under `if master_process:` above — guard here too
+        mfu = compute_mfu(n_params, tokens_per_sec, gpu_peak_tflops) if master_process else None
 
         if master_process and (step % 1 == 0 or step == args.max_steps):
+            mfu_str = f" | MFU: {mfu*100:.1f}%" if mfu is not None else ""
             print(
                 f"Step {step:4d}/{args.max_steps} | "
                 f"Loss: {loss_log:.4f} | "
@@ -358,15 +400,19 @@ def train():
                 f"GradNorm: {grad_norm:.2f} | "
                 f"Time: {dt*1000:.1f}ms | "
                 f"Throughput: {tokens_per_sec:.0f} tok/s"
+                f"{mfu_str}"
             )
 
         if master_process and args.wandb and step % args.wandb_log_interval == 0:
-            wandb.log({
+            log_dict = {
                 "train/loss": loss_log,
                 "train/lr": lr,
                 "train/grad_norm": grad_norm.item(),
                 "perf/tokens_per_sec": tokens_per_sec,
-            }, step=step)
+            }
+            if mfu is not None:
+                log_dict["perf/mfu"] = mfu
+            wandb.log(log_dict, step=step)
 
         if master_process and step % args.save_interval == 0:
             if pending_save_thread is not None:

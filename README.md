@@ -138,6 +138,11 @@ Full CLI options:
 | `--wandb_project` | `1bmodel-pretrain` | W&B project name |
 | `--wandb_run_name` | `run-YYYY-MM-DD-HH-MM-SS` | W&B run name (auto-timestamped if not set) |
 | `--wandb_log_interval` | `10` | Log to W&B every N steps |
+| `--gpu_peak_tflops` | auto-detect | Peak bf16 dense TFLOPS for MFU calc; auto-detected for H100/A100 from the GPU name, override for other GPUs |
+
+### Model FLOP Utilization (MFU)
+
+When running on a recognized GPU (currently H100/A100), `train.py` computes and prints/logs `perf/mfu` each step: `MFU = (6 × params × tokens/sec) / (peak TFLOPS × 1e12)`, the standard forward+backward FLOPs-per-token approximation. Use `--gpu_peak_tflops` to supply a peak-TFLOPS value for other GPUs. Real measured MFU for this model was ~44% on A100 80GB and ~31.5% on H100 (no `torch.compile`) — see [docs/gcp-deployment.md](docs/gcp-deployment.md#mfu-tracking) for the full comparison.
 
 ## Checkpoints
 
@@ -147,182 +152,17 @@ Two checkpoints are written to `--out_dir`, each asynchronously in a background 
 
 Both include `model_state_dict`, `optimizer_state_dict` (AdamW momentum/variance — needed to resume without losing training stability), `config`, and `step`. A failed save raises loudly (`RuntimeError`) instead of silently continuing, so a corrupted or incomplete write is never mistaken for success.
 
-**Resuming**: pass `--resume_from path/to/checkpoint.pt` to continue from an exact file, or `--auto_resume` to have it figure out the path itself (see table above) — the latter is what makes unattended recovery after a preemption possible (see below).
+**Resuming**: pass `--resume_from path/to/checkpoint.pt` to continue from an exact file, or `--auto_resume` to have it figure out the path itself (see table above) — the latter is what makes unattended recovery after a preemption possible (see [docs/gcp-deployment.md](docs/gcp-deployment.md) for the full auto-recovery setup).
 
 **Backing up to GCS**: pass `--gcs_bucket gs://your-bucket/checkpoints` and every save also gets pushed there under the same filename. A failed upload only logs a warning — it never fails the run, since the local copy is already safe.
 
 ## 5. Running on Google Cloud (GCP)
 
-This section documents the full VM setup this pipeline was actually validated against, including the non-obvious gotchas hit along the way — worth reading before spinning up a real run rather than rediscovering them.
+The full pipeline was validated end to end on real GCP GPU hardware (L4 → H100 → A100 40GB → A100 80GB) and is currently running the real 25B-token training job unattended on a preemptible A100 80GB, auto-recovering from preemptions via a Managed Instance Group, with a Cloud Billing budget kill-switch capping spend.
 
-### Create the VM
-
-Use a Deep Learning VM image so CUDA/the NVIDIA driver come pre-installed — check the current image family first (names change):
-
-```bash
-gcloud compute images list --project=deeplearning-platform-release --no-standard-images
-```
-
-Then create the instance (example: single L4 for smoke-testing; see the H100/DDP note below for the real run):
-
-```bash
-gcloud compute instances create my-train-vm \
-  --zone=us-west1-a \
-  --machine-type=g2-standard-8 \
-  --accelerator=type=nvidia-l4,count=1 \
-  --image-family=pytorch-2-9-cu129-ubuntu-2204-nvidia-580 \
-  --image-project=deeplearning-platform-release \
-  --boot-disk-size=200GB \
-  --maintenance-policy=TERMINATE \
-  --metadata="install-nvidia-driver=True"
-```
-
-Notes:
-- Instance names can't start with a digit (GCP naming rule).
-- If a zone reports `ZONE_RESOURCE_POOL_EXHAUSTED` for your chosen GPU, it's transient capacity, not a config error — try another zone.
-- For H100s specifically, GCP's `a3` machine family comes in `a3-highgpu-1g`/`2g`/`4g`/`8g` (GPU count baked into the machine type name, no separate `--accelerator` flag needed) — pick the size matching your actual quota (`gcloud compute regions describe <region> --format=json` to check, though newer quota like H100 sometimes only shows up in the Console's Quotas page, not this command).
-- For a **preemptible** run, add `--preemptible` (check the Console's Quotas page for "Preemptible NVIDIA \<GPU\> GPUs" — this is a separate quota bucket from on-demand and from "Spot").
-
-### Add swap — do this every time, including after a stop/start
-
-GCE VMs have **0 swap by default**. Checkpoint saving briefly needs ~3x model size in CPU memory (model + optimizer state, cloned for the async write); without swap, a memory spike here gets hard-killed by the OOM killer instead of just slowing down. This bit us twice in testing.
-
-```bash
-sudo fallocate -l 20G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
-grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
-```
-
-**The `/etc/fstab` line matters** — without it, swap silently disappears every time the VM stops and starts again (e.g. after a preemption, or after changing its service account scopes), and you'll hit the exact same OOM again on the next checkpoint save with no obvious cause.
-
-### Grant GCS access — two separate permission systems, both required
-
-If you'll use `--gcs_bucket`/`--auto_resume`, the VM needs *both* of these (missing either one fails uploads, with different, easily-confused error messages):
-
-**1. IAM — who can touch the bucket.** A fresh VM's default compute service account is usually not implicitly granted access:
-```bash
-gcloud storage buckets add-iam-policy-binding gs://your-bucket \
-  --member="serviceAccount:<PROJECT_NUMBER>-compute@developer.gserviceaccount.com" \
-  --role="roles/storage.objectAdmin"
-```
-
-**2. OAuth scopes — what the VM's own credentials are allowed to request.** This is separate from IAM and easy to miss: a VM created without an explicit `--scopes` flag often only gets `devstorage.read_only`, which blocks writes *even with correct IAM* (error: `Provided scope(s) are not authorized`). Fixing this requires stopping the VM:
-```bash
-gcloud compute instances stop my-train-vm --zone=us-west1-a
-gcloud compute instances set-service-account my-train-vm --zone=us-west1-a \
-  --service-account=<PROJECT_NUMBER>-compute@developer.gserviceaccount.com \
-  --scopes=https://www.googleapis.com/auth/devstorage.read_write,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write
-gcloud compute instances start my-train-vm --zone=us-west1-a
-```
-
-If uploads still fail with a scope error right after this, `gcloud`'s locally cached credentials on the VM may be stale (they persist on the boot disk across a stop/start). Force a fresh token:
-```bash
-rm -f ~/.config/gcloud/credentials.db ~/.config/gcloud/access_tokens.db
-```
-
-### Set up the code and data
-
-```bash
-git clone https://github.com/<you>/1bmodel.git   # public HTTPS clone needs no auth on a fresh VM
-cd 1bmodel
-pip install torch transformers pyarrow pandas tqdm huggingface_hub wandb
-
-# .env (WANDB_API_KEY) is gitignored, so it doesn't come with git clone — copy it separately:
-#   gcloud compute scp .env my-train-vm:~/1bmodel/.env --zone=us-west1-a
-source .env   # if using --wandb
-
-# Pull the packed dataset from GCS (same-cloud transfer, much faster than the original upload):
-mkdir -p packed_data
-gcloud storage cp gs://your-bucket/train_25b_packed.bin packed_data/train_25b_packed.bin
-```
-
-### Smoke test before the real run
-
-Cheapest first, on whatever single GPU you provisioned — this exercises the same training/checkpoint/resume code paths as the real run at negligible cost:
-
-```bash
-# dummy_data isn't in git (gitignored) — generate it:
-python3 dataset.py
-
-# Basic run: env, CUDA, training loop, checkpoint save
-python3 train.py --data_dir ./dummy_data --out_dir ./ckpt_test \
-  --batch_size 1 --grad_accum_steps 1 --seq_len 128 \
-  --max_steps 5 --warmup_steps 1 --save_interval 2
-
-# Resume: loads model + optimizer + step from the checkpoint above
-python3 train.py --data_dir ./dummy_data --out_dir ./ckpt_test2 \
-  --resume_from ./ckpt_test/model_latest.pt \
-  --batch_size 1 --grad_accum_steps 1 --seq_len 128 \
-  --max_steps 5 --warmup_steps 1 --save_interval 2
-
-# auto_resume + GCS round trip: uploads, then (after deleting the local copy)
-# downloads and resumes automatically — the actual preemption-recovery path
-python3 train.py --data_dir ./dummy_data --out_dir ./ckpt_auto \
-  --batch_size 1 --grad_accum_steps 1 --seq_len 128 \
-  --max_steps 4 --warmup_steps 1 --save_interval 2 \
-  --auto_resume --gcs_bucket gs://your-bucket/checkpoints
-rm -rf ./ckpt_auto
-python3 train.py --data_dir ./dummy_data --out_dir ./ckpt_auto \
-  --batch_size 1 --grad_accum_steps 1 --seq_len 128 \
-  --max_steps 6 --warmup_steps 1 --save_interval 2 \
-  --auto_resume --gcs_bucket gs://your-bucket/checkpoints
-```
-
-Pass criteria: `DEVICE: CUDA` (not CPU/MPS) printed at startup, `Initial Loss CHECK PASSED`, every checkpoint line reads `✅ Saved`/`☁️ Uploaded` (never `❌ FAILED`), and the second `auto_resume` run prints `📂 Resuming from checkpoint` continuing from the right step — all with exit code 0.
-
-Delete test checkpoints (`rm -rf ckpt_test ckpt_test2 ckpt_auto`) before moving to the real run — at ~13-14GB each (model + optimizer state, fp32), they add up fast against a VM's boot disk.
-
-### Validated on real H100 hardware
-
-The full pipeline above (environment, training loop, checkpoint save, `--resume_from`, `--auto_resume` + `--gcs_bucket` round trip, `--wandb`) was re-run end to end on an actual `a3-highgpu-1g` (1× H100 80GB) preemptible VM — not just the L4 used for the cheaper smoke tests — to confirm nothing about this specific GPU generation breaks the pipeline. A real W&B run (5 steps, toy config) confirms logging works on real GCP infra, not just locally:
+For VM setup, IAM/OAuth scope gotchas, the smoke-test walkthrough, the MIG auto-recovery setup, the budget kill-switch, real GCP-vs-Azure pricing, and the GPU-selection lessons (why A100 40GB OOM'd where H100 and A100 80GB didn't) — see **[docs/gcp-deployment.md](docs/gcp-deployment.md)**.
 
 <p float="left">
   <img src="docs/images/wandb-h100-perf.png" width="45%" alt="W&B perf/tokens_per_sec chart from the H100 validation run" />
   <img src="docs/images/wandb-h100-train.png" width="45%" alt="W&B train/lr, train/loss, train/grad_norm charts from the H100 validation run" />
 </p>
-
-Throughput climbs to ~2,700-2,800 tok/s after the first (warmup/kernel-compile) step — for comparison, the same toy config on an L4 topped out around ~1,200 tok/s. `train/lr` follows the expected cosine decay, `train/loss` and `train/grad_norm` are just noise at this scale (5 steps on a randomly-initialized model isn't enough to show real learning — this run validates plumbing, not convergence).
-
-Only single-GPU has been validated this way — real multi-GPU DDP (`torchrun --nproc_per_node=2+`) is still unverified, blocked by this project's `GPUS_ALL_REGIONS` quota (see below).
-
-### Preemptible/Spot: what actually happens on preemption
-
-GCP stops (not deletes) a preempted VM — the boot disk and its local checkpoints survive. But nothing restarts it or re-launches training automatically. Without further setup, recovering means: notice it stopped → `gcloud compute instances start` it yourself → SSH in → re-run `train.py --auto_resume ...` yourself. `--auto_resume` makes that last step safe and mindless (no need to track which checkpoint or where), but doesn't eliminate the manual restart.
-
-For fully hands-off recovery, the standard GCP pattern is a **Managed Instance Group (MIG)** with target size 1, built from an instance template whose `startup-script` runs the training command (with `--auto_resume --gcs_bucket ...`) on every boot. When preempted, the MIG detects it and creates a *replacement* VM from the template — a fresh disk with no local checkpoint, which is exactly the case `--auto_resume`'s GCS fallback exists for.
-
-```bash
-# Secrets that can't live in git go in the same bucket instead, pulled by the startup-script:
-gcloud storage cp .env gs://your-bucket/secrets/.env
-
-# Instance template: same VM config as above, plus a startup-script (see below)
-gcloud compute instance-templates create my-train-template \
-  --machine-type=a3-highgpu-1g \
-  --image-family=pytorch-2-9-cu129-ubuntu-2204-nvidia-580 \
-  --image-project=deeplearning-platform-release \
-  --boot-disk-size=200GB \
-  --maintenance-policy=TERMINATE \
-  --provisioning-model=SPOT \
-  --instance-termination-action=STOP \
-  --metadata="install-nvidia-driver=True" \
-  --metadata-from-file=startup-script=startup-script.sh \
-  --service-account=<PROJECT_NUMBER>-compute@developer.gserviceaccount.com \
-  --scopes=https://www.googleapis.com/auth/devstorage.read_write,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write
-
-# Regional MIG (spans multiple zones) beats a zonal one: a single zone can be
-# capacity-constrained (ZONE_RESOURCE_POOL_EXHAUSTED — not a quota error, just
-# no H100s free there right now) even when the region overall has quota and stock.
-gcloud compute instance-groups managed create my-train-mig \
-  --base-instance-name=my-train \
-  --template=my-train-template \
-  --size=1 \
-  --region=us-west1 \
-  --zones=us-west1-a,us-west1-b
-```
-
-`startup-script.sh` does everything a manual setup would (idempotently, since it runs on every boot including replacement instances): re-arm swap, `git pull` the repo, install deps, pull `.env` and the packed dataset from GCS, then launch `train.py` with `--auto_resume --gcs_bucket ... --wandb`. `--provisioning-model=SPOT --instance-termination-action=STOP` is the instance-template-level equivalent of the standalone `--preemptible` flag used elsewhere in this doc — same quota bucket, just the API surface MIGs expect.
-
-Check MIG health with:
-```bash
-gcloud compute instance-groups managed list-instances my-train-mig --region=us-west1
-gcloud compute instance-groups managed list-errors my-train-mig --region=us-west1
-```
