@@ -15,6 +15,13 @@ Measured on the real training run (config: `batch_size=8, grad_accum_steps=16, s
 
 \* H100 runs predate the MFU-logging feature (`perf/mfu` was added after the H100→A100 switch), so this is computed post hoc from the same formula (`6 × params × tokens/sec / peak_TFLOPS`) applied to the logged `tokens/sec`, not read directly from a W&B field.
 
+W&B charts from the A100 80GB run (steps ~15,510-15,590, the last stretch before the pause described below) — `perf/tokens_per_sec` and `perf/mfu` track each other exactly, as expected since MFU is just tokens/sec rescaled by a constant:
+
+<p float="left">
+  <img src="docs/images/wandb-a100-perf.png" width="45%" alt="W&B perf/tokens_per_sec and perf/mfu charts from the A100 80GB run" />
+  <img src="docs/images/wandb-a100-train.png" width="45%" alt="W&B train/lr, train/loss, train/grad_norm charts from the A100 80GB run" />
+</p>
+
 ### Why the faster GPU shows lower utilization
 
 This looks like a contradiction — H100 is ~2.3x faster in wall-clock throughput but uses a *smaller* fraction of its own peak compute. It isn't: MFU is a ratio to peak FLOPS, not a speed, and the two chips aren't balanced the same way.
