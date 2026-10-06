@@ -6,7 +6,18 @@ The full architecture, parameter count, and memory/throughput derivation live in
 
 ## Results
 
-**Training target:** 25B tokens — 95,367 steps at 262,144 tokens/step (`batch_size=8, grad_accum_steps=16, seq_len=2048`, 1 GPU equiv.). **Current position: step 65,517 / ~10.4B tokens consumed (~41.5% complete).** Actual parameter count 1,185,204,224 (design doc rounded to 1.24B).
+**Training target:** 25B tokens — 95,367 steps at 262,144 tokens/step (`batch_size=8, grad_accum_steps=16, seq_len=2048`, standard config). **Current position: ~10.4B tokens consumed (~41.5% complete).**
+
+The checkpoint's `step` counter reads 65,517, but that number is not directly comparable to the 95,367 target. Steps 0→31,175 ran at 262,144 tok/step (4-GPU config); steps 31,001→65,517 ran at 65,536 tok/step (1-GPU, same micro-batch but no data-parallel — 4× fewer tokens per optimizer step). So the step counter advanced 4× faster than tokens in the last run, making 65,517 look like 68% complete when it is actually only 41.5%. **Tokens are the canonical progress metric.** Actual parameter count 1,185,204,224 (design doc rounded to 1.24B).
+
+**Why GPU count, tok/step, and max_steps are all linked:**
+
+```
+tok/step  = batch_size × grad_accum_steps × seq_len × world_size
+max_steps = total_tokens / tok/step
+```
+
+Every additional GPU multiplies tok/step by `world_size`, which divides max_steps by the same factor. More GPUs → larger effective batch → fewer, longer steps to cover the same token budget. The LR schedule is indexed by step, so it ticks the same cosine arc from max_lr to min_lr in fewer steps; per token, the LR trajectory is unchanged, but each step "costs" more tokens before the LR budges. If GPU count changes mid-run, max_steps must be rescaled proportionally to maintain the same per-token LR curve — exactly what happened when the run dropped from 4×L40S to 1×L40S (max_steps was adjusted from 95,367 to 159,564 to preserve the token budget). The conventional corollary: a larger effective batch typically calls for a larger LR (square-root scaling rule: `LR ∝ √batch`). In this run, LR was kept constant through the GPU-count change, leaving the single-GPU phase at a slightly sub-optimal LR-to-batch ratio — it still trained, but this is a known trade-off worth revisiting if training resumes.
 
 Measured across all real training runs, sourced from W&B (`1bmodel-pretrain`) and CloudWatch logs:
 
