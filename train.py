@@ -3,6 +3,7 @@ import math
 import time
 import argparse
 import threading
+import shutil
 import subprocess
 from dataclasses import asdict
 
@@ -10,16 +11,50 @@ import torch
 import torch.nn.functional as F
 import wandb
 from torch.utils.data import DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
+    get_optimizer_state_dict,
+    set_optimizer_state_dict,
+)
 
 from model import Transformer1B, ModelConfig
 from dataset import PretrainBinaryDataset
 
 
-def _async_save_worker(checkpoint_data, save_path, result, gcs_dest=None):
+def remote_cp(src, dst):
+    """Copy src -> dst where either side may be a gs:// or s3:// URL."""
+    if src.startswith("s3://") or dst.startswith("s3://"):
+        cmd = ["aws", "s3", "cp", src, dst]
+    else:
+        cmd = ["gcloud", "storage", "cp", src, dst]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
+def _atomic_torch_save(checkpoint_data, save_path):
+    """Write to a temp file, then rename over save_path, so save_path is never a
+    half-written file — anything syncing/uploading the checkpoint directory in the
+    background (SageMaker does) or a preemption mid-write can't leave a corrupt
+    model_latest.pt behind. The temp file sits in the directory *above* save_path's
+    so such a sync doesn't pick it up; if that's on a different filesystem the
+    rename can't be atomic and falls back to a plain move."""
+    out_dir = os.path.dirname(os.path.abspath(save_path))
+    tmp_path = os.path.join(os.path.dirname(out_dir), f".{os.path.basename(save_path)}.partial")
+    torch.save(checkpoint_data, tmp_path)
     try:
-        torch.save(checkpoint_data, save_path)
+        os.replace(tmp_path, save_path)
+    except OSError:
+        shutil.move(tmp_path, save_path)
+
+
+def _async_save_worker(checkpoint_data, save_path, result, remote_dest=None):
+    try:
+        _atomic_torch_save(checkpoint_data, save_path)
         result['ok'] = True
         print(f"\n✅ [Async Checkpoint] Saved to: {save_path}\n")
     except Exception as e:
@@ -28,19 +63,16 @@ def _async_save_worker(checkpoint_data, save_path, result, gcs_dest=None):
         print(f"\n❌ [Async Checkpoint] FAILED to save {save_path}: {e}\n")
         return  # local save failed — nothing valid to upload
 
-    if gcs_dest:
+    if remote_dest:
         # Runs in this same background thread so the upload doesn't block training
         # either. A failed upload does NOT fail the checkpoint overall (result['ok']
         # stays True) — the local file is already safe; this is a best-effort backup.
         try:
-            subprocess.run(
-                ["gcloud", "storage", "cp", save_path, gcs_dest],
-                check=True, capture_output=True, text=True,
-            )
-            print(f"\n☁️  [GCS Upload] Uploaded to: {gcs_dest}\n")
+            remote_cp(save_path, remote_dest)
+            print(f"\n☁️  [Remote Upload] Uploaded to: {remote_dest}\n")
         except Exception as e:
             detail = e.stderr if isinstance(e, subprocess.CalledProcessError) else str(e)
-            print(f"\n⚠️  [GCS Upload] FAILED to upload {save_path} to {gcs_dest}: {detail}\n")
+            print(f"\n⚠️  [Remote Upload] FAILED to upload {save_path} to {remote_dest}: {detail}\n")
 
 
 def _to_cpu_clone(obj):
@@ -60,15 +92,73 @@ def _to_cpu_clone(obj):
     return obj
 
 
-def async_save_checkpoint(checkpoint_data, save_path, gcs_dest=None):
-    checkpoint_data['model_state_dict'] = _to_cpu_clone(checkpoint_data['model_state_dict'])
-    if 'optimizer_state_dict' in checkpoint_data:
-        checkpoint_data['optimizer_state_dict'] = _to_cpu_clone(checkpoint_data['optimizer_state_dict'])
+def async_save_checkpoint(checkpoint_data, save_path, remote_dest=None, already_copied=False):
+    # already_copied: the state dicts were gathered into fresh CPU tensors (FSDP path),
+    # so they're already decoupled from the live training tensors — skip the extra copy.
+    if not already_copied:
+        checkpoint_data['model_state_dict'] = _to_cpu_clone(checkpoint_data['model_state_dict'])
+        if 'optimizer_state_dict' in checkpoint_data:
+            checkpoint_data['optimizer_state_dict'] = _to_cpu_clone(checkpoint_data['optimizer_state_dict'])
     result = {}
-    thread = threading.Thread(target=_async_save_worker, args=(checkpoint_data, save_path, result, gcs_dest))
+    thread = threading.Thread(target=_async_save_worker, args=(checkpoint_data, save_path, result, remote_dest))
     thread.result = result
     thread.start()
     return thread
+
+
+_FULL_SD = StateDictOptions(full_state_dict=True, cpu_offload=True)
+
+
+def gather_checkpoint(model, optimizer, config, step):
+    """Collective — EVERY rank must call this. Gathers the sharded FSDP state into
+    full (unsharded) CPU state dicts on rank 0 (other ranks get empty dicts), so the
+    checkpoint on disk is a single portable file independent of world size. Optimizer
+    state is keyed by parameter name."""
+    return {
+        'model_state_dict': get_model_state_dict(model, options=_FULL_SD),
+        'optimizer_state_dict': get_optimizer_state_dict(model, optimizer, options=_FULL_SD),
+        'config': asdict(config),
+        'step': step,
+    }
+
+
+def _param_names_in_optimizer_order(model):
+    """Parameter names in the order the optimizer's param groups were built:
+    decay group (ndim >= 2) first, then no-decay group. Activation-checkpoint
+    wrapper prefixes are stripped so names match the state_dict."""
+    names = [(n.replace("_checkpoint_wrapped_module.", ""), p) for n, p in model.named_parameters() if p.requires_grad]
+    return [n for n, p in names if p.dim() >= 2] + [n for n, p in names if p.dim() < 2]
+
+
+def _optim_sd_for_resume(optim_sd, model, optimizer):
+    """Checkpoints written by the old DDP script key optimizer state by integer
+    parameter index; the FSDP save keys it by parameter name. Convert the old form
+    so a checkpoint from either script can be resumed.
+
+    Also backfills any param_group key the checkpoint doesn't have but the live
+    optimizer does (e.g. 'decoupled_weight_decay', added to AdamW's param_groups in
+    a later PyTorch release than whatever wrote the checkpoint) — DCP's optimizer
+    load matches param_groups by key set, and a mismatch there raises a bare
+    KeyError with no clue it's a version issue. Groups line up by index in both
+    the checkpoint and the live optimizer (decay group first, then no-decay)."""
+    is_old_format = any(isinstance(k, int) for k in optim_sd['state']) or \
+        any(isinstance(i, int) for g in optim_sd['param_groups'] for i in g['params'])
+    if is_old_format:
+        names = _param_names_in_optimizer_order(model)
+        state = {names[i]: v for i, v in optim_sd['state'].items()}
+        param_groups = [{**g, 'params': [names[i] for i in g['params']]} for g in optim_sd['param_groups']]
+    else:
+        state = optim_sd['state']
+        param_groups = [dict(g) for g in optim_sd['param_groups']]
+
+    live_groups = optimizer.param_groups
+    assert len(param_groups) == len(live_groups), \
+        f"checkpoint has {len(param_groups)} optimizer param groups, live optimizer has {len(live_groups)}"
+    for g, live_g in zip(param_groups, live_groups):
+        for k, v in live_g.items():
+            g.setdefault(k, v)
+
+    return {'state': state, 'param_groups': param_groups}
 
 
 def _check_save_ok(thread, label):
@@ -110,13 +200,14 @@ def detect_gpu_peak_tflops(override=None):
     return None  # unknown GPU: MFU just won't be computed/logged
 
 
-def compute_mfu(n_params, tokens_per_sec, gpu_peak_tflops):
+def compute_mfu(n_params, tokens_per_sec_per_gpu, gpu_peak_tflops):
     """MFU = achieved FLOPs/s ÷ peak FLOPs/s. Achieved FLOPs/s uses the
     standard 6N-per-token approximation (2N fwd + 4N bwd) from the
-    Chinchilla/PaLM papers — ignores attention's own FLOPs, fine as an estimate."""
+    Chinchilla/PaLM papers — ignores attention's own FLOPs, fine as an estimate.
+    Pass per-GPU throughput: the peak is for a single GPU."""
     if gpu_peak_tflops is None:
         return None
-    achieved_flops = 6 * n_params * tokens_per_sec
+    achieved_flops = 6 * n_params * tokens_per_sec_per_gpu
     return achieved_flops / (gpu_peak_tflops * 1e12)
 
 
@@ -135,12 +226,27 @@ def train():
     parser.add_argument("--save_interval", type=int, default=500, help="Save a checkpoint every N steps")
     parser.add_argument("--resume_from", type=str, default=None,
                          help="Path to a checkpoint to resume model + optimizer + step from")
-    parser.add_argument("--gcs_bucket", type=str, default=None,
-                         help="If set (e.g. gs://bucket/checkpoints), upload each checkpoint there "
-                              "via `gcloud storage cp` right after it saves locally")
+    parser.add_argument("--remote_dir", "--gcs_bucket", dest="remote_dir", type=str, default=None,
+                         help="If set (gs://bucket/path or s3://bucket/path), upload each checkpoint "
+                              "there (via `gcloud storage cp` / `aws s3 cp`) right after it saves locally")
+    parser.add_argument("--activation_checkpointing", action="store_true",
+                         help="Recompute each transformer block's activations in backward instead of "
+                              "storing them: ~30%% slower, but lets a larger --batch_size fit in 24GB")
+    parser.add_argument("--defer_grad_sync", action="store_true",
+                         help="FSDP: only reduce-scatter gradients on the last micro-step of each "
+                              "accumulation window (much less communication, but holds unsharded "
+                              "gradients in memory in between)")
+    parser.add_argument("--stop_after_steps", type=int, default=None,
+                         help="Preflight/testing: run only this many steps (counting from the resume "
+                              "point) with the real --max_steps LR schedule, then exit WITHOUT writing "
+                              "the final checkpoint")
+    parser.add_argument("--seed", type=int, default=1337,
+                         help="Model-init seed; must be identical on every rank under FSDP")
+    parser.add_argument("--d_model", type=int, default=2048, help="Override only for smoke tests")
+    parser.add_argument("--n_layers", type=int, default=24, help="Override only for smoke tests")
     parser.add_argument("--auto_resume", action="store_true",
                          help="If --resume_from isn't given, look for out_dir/model_latest.pt "
-                              "locally first, then gs://<gcs_bucket>/model_latest.pt if not found "
+                              "locally first, then <remote_dir>/model_latest.pt if not found "
                               "locally, and resume from whichever turns up (starts fresh if neither "
                               "exists — meant for restarting on a fresh VM after preemption)")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
@@ -166,12 +272,12 @@ def train():
         device = 'cpu'
         autocast_dtype = torch.float32
 
-    ddp = int(os.environ.get('RANK', -1)) != -1
-    if ddp:
-        dist.init_process_group(backend='nccl')
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        device = f'cuda:{ddp_local_rank}'
-        torch.cuda.set_device(device)
+    distributed = int(os.environ.get('RANK', -1)) != -1
+    if distributed:
+        dist.init_process_group(backend='nccl' if device == 'cuda' else 'gloo')
+        if device == 'cuda':
+            device = f"cuda:{int(os.environ['LOCAL_RANK'])}"
+            torch.cuda.set_device(device)
         master_process = (int(os.environ['RANK']) == 0)
         world_size = dist.get_world_size()
     else:
@@ -196,11 +302,14 @@ def train():
 
     config = ModelConfig(
         vocab_size=50280,
-        d_model=2048,
-        n_layers=24,
+        d_model=args.d_model,
+        n_layers=args.n_layers,
         max_seq_len=8192,
     )
 
+    # FSDP shards each rank's *own* locally-initialised weights (unlike DDP it does not
+    # broadcast rank 0's), so every rank must initialise identically.
+    torch.manual_seed(args.seed)
     model = Transformer1B(config).to(device)
 
     if master_process:
@@ -231,10 +340,27 @@ def train():
             }
         )
 
-    if ddp:
-        model = DDP(model, device_ids=[int(os.environ['LOCAL_RANK'])])
+    if distributed:
+        # FSDP2: each transformer block is its own all-gather unit; the root group holds
+        # the (tied) embedding/output weight and the final norm. Params are gathered and
+        # computed in bf16, gradients reduced in fp32; the fp32 master weights and Adam
+        # state stay sharded across ranks.
+        mp_policy = MixedPrecisionPolicy(param_dtype=autocast_dtype, reduce_dtype=torch.float32)
+        mesh = init_device_mesh('cuda' if use_cuda else 'cpu', (world_size,))
+        if args.activation_checkpointing:
+            for i, layer in enumerate(model.layers):
+                model.layers[i] = checkpoint_wrapper(layer, preserve_rng_state=False)
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
+        fully_shard(model, mesh=mesh, mp_policy=mp_policy)
+        if use_cuda:
+            torch.cuda.empty_cache()  # release the transient full fp32 copy from init
+    elif args.activation_checkpointing:
+        for i, layer in enumerate(model.layers):
+            model.layers[i] = checkpoint_wrapper(layer, preserve_rng_state=False)
 
-    raw_model = model.module if ddp else model
+    # fully_shard mutates the module in place (no wrapper), so this is the same object.
+    raw_model = model
 
     if args.compile and hasattr(torch, 'compile'):
         if master_process:
@@ -243,6 +369,7 @@ def train():
 
     # Only apply weight decay to matmul-participating weights (ndim >= 2).
     # RMSNorm scale params (ndim == 1) are excluded to avoid decaying them toward zero.
+    # (_param_names_in_optimizer_order relies on this exact grouping/order.)
     decay_params = [p for p in raw_model.parameters() if p.requires_grad and p.dim() >= 2]
     no_decay_params = [p for p in raw_model.parameters() if p.requires_grad and p.dim() < 2]
     optimizer = torch.optim.AdamW(
@@ -270,6 +397,13 @@ def train():
             assert abs(init_loss.item() - expected_loss) < 1.5, "Initial Loss mismatch!"
             print("  -> Initial Loss CHECK PASSED!\n")
 
+    if distributed:
+        # A forward with no backward leaves the root FSDP group unsharded (only the
+        # post-backward hook reshards it). Do it now: otherwise state_dict() hands back
+        # plain tensors for the embedding/output/norm and loading a checkpoint fails,
+        # and the gathered bf16 embedding would stay resident in VRAM.
+        raw_model.reshard()
+
     # Resume from checkpoint (after the sanity check above, so it still validates a
     # fresh init) — restores model + optimizer state, and continues the step/LR
     # schedule from where it left off. Note: the data iterator itself restarts from
@@ -281,19 +415,18 @@ def train():
             resume_path = local_latest
             if master_process:
                 print(f"🔎 --auto_resume: found local checkpoint at {resume_path}")
-        elif args.gcs_bucket:
-            gcs_latest = f"{args.gcs_bucket.rstrip('/')}/model_latest.pt"
+        elif args.remote_dir:
+            remote_latest = f"{args.remote_dir.rstrip('/')}/model_latest.pt"
             if master_process:
-                print(f"🔎 --auto_resume: no local checkpoint, trying {gcs_latest} ...")
+                print(f"🔎 --auto_resume: no local checkpoint, trying {remote_latest} ...")
                 try:
-                    subprocess.run(["gcloud", "storage", "cp", gcs_latest, local_latest],
-                                    check=True, capture_output=True, text=True)
-                    print(f"   -> downloaded from GCS\n")
+                    remote_cp(remote_latest, local_latest)
+                    print(f"   -> downloaded from remote\n")
                 except Exception as e:
                     detail = e.stderr if isinstance(e, subprocess.CalledProcessError) else str(e)
-                    print(f"   -> nothing found on GCS either ({detail.strip()}); starting fresh\n")
+                    print(f"   -> nothing found remotely either ({detail.strip()}); starting fresh\n")
             # One rank downloads; the rest wait so they don't race on the same file.
-            if ddp:
+            if distributed:
                 dist.barrier()
             if os.path.exists(local_latest):
                 resume_path = local_latest
@@ -302,14 +435,19 @@ def train():
     if resume_path:
         if master_process:
             print(f"📂 Resuming from checkpoint: {resume_path}")
-        # Load to CPU, not `device`: model/optimizer .load_state_dict() already cast
-        # and move each tensor to the right device on their own. Loading straight to
-        # GPU would leave the now-redundant loaded tensors (~model size) referenced
-        # by resume_ckpt and stranded in VRAM for the rest of training, on top of
-        # the model's own real footprint — enough to OOM a memory-constrained GPU.
-        resume_ckpt = torch.load(resume_path, map_location='cpu', weights_only=False)
-        raw_model.load_state_dict(resume_ckpt['model_state_dict'])
-        optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
+        # Load to CPU, not `device`: the state-dict setters already move each tensor
+        # (or, under FSDP, just this rank's shard of it) to the right device. Loading
+        # straight to GPU would leave the redundant full tensors stranded in VRAM.
+        # Every rank reads the full file; mmap keeps that as one shared page-cache copy
+        # instead of world_size private ~14GB copies in host RAM.
+        resume_ckpt = torch.load(resume_path, map_location='cpu', mmap=True, weights_only=False)
+        load_opts = StateDictOptions(full_state_dict=True)
+        set_model_state_dict(raw_model, resume_ckpt['model_state_dict'], options=load_opts)
+        set_optimizer_state_dict(
+            raw_model, optimizer,
+            optim_state_dict=_optim_sd_for_resume(resume_ckpt['optimizer_state_dict'], raw_model, optimizer),
+            options=load_opts,
+        )
         start_step = resume_ckpt['step'] + 1
         if master_process:
             print(f"   -> Resumed at step {resume_ckpt['step']}, continuing from step {start_step}\n")
@@ -335,7 +473,12 @@ def train():
 
     pending_save_thread = None
 
-    for step in range(start_step, args.max_steps + 1):
+    last_step = args.max_steps
+    if args.stop_after_steps is not None:
+        last_step = min(args.max_steps, start_step + args.stop_after_steps - 1)
+    stopped_early = last_step < args.max_steps
+
+    for step in range(start_step, last_step + 1):
         t0 = time.time()
         
         lr = get_lr(step, args.warmup_steps, args.max_steps, args.max_lr, args.min_lr)
@@ -359,37 +502,38 @@ def train():
 
             is_last_micro_step = (micro_step == args.grad_accum_steps - 1)
             
-            if ddp and not is_last_micro_step:
-                ctx = model.no_sync()
-            else:
-                ctx = torch.enable_grad()
+            if distributed and args.defer_grad_sync:
+                model.set_requires_gradient_sync(is_last_micro_step)
 
-            with ctx:
-                if use_cuda:
-                    with torch.autocast(device_type='cuda', dtype=autocast_dtype):
-                        logits, loss = model(x, y)
-                else:
+            if use_cuda:
+                with torch.autocast(device_type='cuda', dtype=autocast_dtype):
                     logits, loss = model(x, y)
+            else:
+                logits, loss = model(x, y)
 
-                # Scale loss for gradient accumulation
-                loss = loss / args.grad_accum_steps
-                loss_accum += loss.detach() * args.grad_accum_steps
-                loss.backward()
+            # Scale loss for gradient accumulation
+            loss = loss / args.grad_accum_steps
+            loss_accum += loss.detach() * args.grad_accum_steps
+            loss.backward()
 
-        if ddp:
-            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        if distributed:
+            # SUM then divide (not ReduceOp.AVG): gloo, used for CPU smoke tests, lacks AVG.
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.SUM)
+            loss_accum /= world_size
 
         # Average accumulated loss across steps
         loss_log = loss_accum.item() / args.grad_accum_steps
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if hasattr(grad_norm, 'full_tensor'):  # FSDP returns a DTensor
+            grad_norm = grad_norm.full_tensor()
         optimizer.step()
 
         t1 = time.time()
         dt = t1 - t0
         tokens_per_sec = tokens_per_iter / dt
         # n_params is only assigned under `if master_process:` above — guard here too
-        mfu = compute_mfu(n_params, tokens_per_sec, gpu_peak_tflops) if master_process else None
+        mfu = compute_mfu(n_params, tokens_per_sec / world_size, gpu_peak_tflops) if master_process else None
 
         if master_process and (step % 1 == 0 or step == args.max_steps):
             mfu_str = f" | MFU: {mfu*100:.1f}%" if mfu is not None else ""
@@ -414,34 +558,38 @@ def train():
                 log_dict["perf/mfu"] = mfu
             wandb.log(log_dict, step=step)
 
-        if master_process and step % args.save_interval == 0:
-            if pending_save_thread is not None:
+        if step % args.save_interval == 0:
+            if master_process and pending_save_thread is not None:
                 _check_save_ok(pending_save_thread, "Periodic")
-            save_path = os.path.join(args.out_dir, "model_latest.pt")
-            ckpt = {
-                'model_state_dict': raw_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'config': asdict(config),
-                'step': step,
-            }
-            print(f"\n💾 [Step {step}] Saving periodic checkpoint...")
-            gcs_dest = f"{args.gcs_bucket.rstrip('/')}/model_latest.pt" if args.gcs_bucket else None
-            pending_save_thread = async_save_checkpoint(ckpt, save_path, gcs_dest)
+            if master_process:
+                print(f"\n💾 [Step {step}] Saving periodic checkpoint...")
+            # Gathering the shards is collective, so all ranks take part; only rank 0
+            # gets (and writes) the data.
+            ckpt = gather_checkpoint(raw_model, optimizer, config, step)
+            if master_process:
+                save_path = os.path.join(args.out_dir, "model_latest.pt")
+                remote_dest = f"{args.remote_dir.rstrip('/')}/model_latest.pt" if args.remote_dir else None
+                pending_save_thread = async_save_checkpoint(ckpt, save_path, remote_dest, already_copied=True)
 
     # 3. Save Final Checkpoint
+    if stopped_early:
+        if master_process:
+            print(f"\n🛑 --stop_after_steps: stopped at step {last_step}/{args.max_steps}; "
+                  "no final checkpoint written.")
+            if args.wandb:
+                wandb.finish()
+        if distributed:
+            dist.destroy_process_group()
+        return
     if master_process:
         if pending_save_thread is not None:
             _check_save_ok(pending_save_thread, "Periodic")
         print("\n💾 Saving final checkpoint...")
+    ckpt = gather_checkpoint(raw_model, optimizer, config, args.max_steps)
+    if master_process:
         save_path = os.path.join(args.out_dir, "model_final.pt")
-        ckpt = {
-            'model_state_dict': raw_model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'config': asdict(config),
-            'step': args.max_steps,
-        }
-        gcs_dest = f"{args.gcs_bucket.rstrip('/')}/model_final.pt" if args.gcs_bucket else None
-        save_thread = async_save_checkpoint(ckpt, save_path, gcs_dest)
+        remote_dest = f"{args.remote_dir.rstrip('/')}/model_final.pt" if args.remote_dir else None
+        save_thread = async_save_checkpoint(ckpt, save_path, remote_dest, already_copied=True)
         print("⏳ Waiting for final checkpoint to finish writing to disk...")
         _check_save_ok(save_thread, "Final")
         print("🎉 TRAINING PIPELINE COMPLETED SUCCESSFULLY!")
@@ -449,7 +597,7 @@ def train():
     if master_process and args.wandb:
         wandb.finish()
 
-    if ddp:
+    if distributed:
         dist.destroy_process_group()
 
 

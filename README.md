@@ -8,12 +8,19 @@ The full architecture, parameter count, and memory/throughput derivation live in
 
 Measured on the real training run (config: `batch_size=8, grad_accum_steps=16, seq_len=2048` → 262,144 tokens/step; actual parameter count 1,185,204,224, not the design doc's rounded 1.24B), sourced from the project's W&B history (`1bmodel-pretrain`):
 
-| GPU | Peak BF16 dense | Measured MFU | Effective throughput | Tokens/sec | Step time |
-|---|---|---|---|---|---|
-| A100 80GB | 312 TFLOPS | 44% (avg of 10 logged steps) | ~137 TFLOPS | ~19,210 tok/s | ~13.6 s/step |
-| H100 (no `torch.compile`) | 989 TFLOPS | 31.5%* | ~311 TFLOPS | ~43,700 tok/s | ~6.0 s/step |
+| GPU | Peak BF16 | Measured MFU | Eff. throughput | Tok/s | Step time | Notes |
+|---|---|---|---|---|---|---|
+| H100 80GB (no `torch.compile`) | 989 TFLOPS | 31.5%† | ~311 TFLOPS | ~43,700 | ~6.0 s | GCP `a3-highgpu-1g`; steps 0→12,360 |
+| A100 80GB | 312 TFLOPS | 44% (avg 10 steps) | ~137 TFLOPS | ~19,210 | ~13.6 s | GCP `a2-ultragpu-1g`; **main training GPU** |
+| A100 40GB | 312 TFLOPS | 29.5%‡ | ~92 TFLOPS | ~12,900 | ~20.3 s | Forced `batch=1` (OOM at ≥4); impractical |
+| L4 24GB | 121.4 TFLOPS | ~7%§ | ~8.5 TFLOPS | ~1,200 | — | Smoke test only (`batch=1, seq=128`); not a real training run |
+| A10G 24GB ×4 (FSDP2) | 125 TFLOPS | — | — | — | — | AWS `ml.g5.12xlarge`; not run (credit exhausted) |
 
-\* H100 runs predate the MFU-logging feature (`perf/mfu` was added after the H100→A100 switch), so this is computed post hoc from the same formula (`6 × params × tokens/sec / peak_TFLOPS`) applied to the logged `tokens/sec`, not read directly from a W&B field.
+† H100 runs predate the `perf/mfu` W&B field — computed post hoc from the same formula (`6 × params × tok/s / peak_TFLOPS`) applied to logged `tokens/sec`.
+
+‡ A100 40GB MFU is from [docs/gcp-deployment.md](docs/gcp-deployment.md#mfu-tracking); `batch=1` was the only config that fit in 40GB after `batch=8` and `batch=4` both OOM'd.
+
+§ L4 throughput is from a 5-step smoke test at a toy config (`batch=1, seq_len=128`) — not a real training run at the standard `batch=8, seq_len=2048` shape. MFU = `6 × 1.185B × 1200 / (121.4T)` ≈ 7% confirms the L4 is compute-bound by the tiny batch, not a meaningful ceiling estimate. L4 peak bf16 dense: 121.4 TFLOPS.
 
 W&B charts from the A100 80GB run (steps ~15,510-15,590, the last stretch before the pause described below) — `perf/tokens_per_sec` and `perf/mfu` track each other exactly, as expected since MFU is just tokens/sec rescaled by a constant:
 
@@ -40,7 +47,7 @@ This looks like a contradiction — H100 is ~2.3x faster in wall-clock throughpu
 - **DDP was never exercised.** This project's `GPUS_ALL_REGIONS` quota stayed capped at 1 for the entire run (see [docs/gcp-deployment.md](docs/gcp-deployment.md)), so every step of real training ran on a single GPU, not the 8 the design assumed. That alone is roughly an 8x wall-clock penalty independent of any per-GPU efficiency.
 - **Per-GPU efficiency landed close to plan.** Design assumed MFU=0.45 on H100; measured MFU on A100 (44%) came in almost exactly on target, and H100 (31.5%, uncompiled) is the outlier explained above, not a modeling error.
 - **Sequence length and batch shape changed** from the design's `seq_len=8192, batch=4` to the actually-run `seq_len=2048, batch_size=8, grad_accum_steps=16` — same order of tokens/step (262K vs the design's 257K), different shape, driven by the memory constraints below.
-- **Status: paused at step 15,510 / 95,367 (~16.3% of target tokens)**, loss ~2.31 (down from the expected fresh-init ~11 = -ln(1/64K)). It is not stopped due to a training bug — it's paused because of infrastructure/cost economics: a multi-day `ZONE_RESOURCE_POOL_EXHAUSTED` stretch on A100 80GB preemptible capacity in `us-central1-a` turned into a preempt→resume→preempt loop that made minimal net progress per wall-clock hour, spend had already reached ~$266 (past the $250 kill-switch threshold — see below), and the planned Azure fallback wasn't available (no credit approved). The checkpoint is safe in GCS; resuming is a one-line MIG resize.
+- **Status: paused at step 15,510 / 95,367 (~16.3% of target tokens)**, loss ~2.31 (down from the expected fresh-init ~11 = -ln(1/64K)). It is not stopped due to a training bug — it's paused because of infrastructure/cost economics: a multi-day `ZONE_RESOURCE_POOL_EXHAUSTED` stretch on A100 80GB preemptible capacity in `us-central1-a` turned into a preempt→resume→preempt loop that made minimal net progress per wall-clock hour, spend had already reached ~$266 (past the $250 kill-switch threshold). AWS SageMaker was set up as a fallback (see [docs/aws-deployment.md](docs/aws-deployment.md)) but the AWS credit was exhausted before the first real GPU run. **Checkpoint and packed dataset are now backed up in both GCS and Azure Blob Storage** (see [Multi-cloud model transfer](#multi-cloud-model-transfer) below); next training will resume on Azure or GCP when credit is available — resuming on GCP is a one-line MIG resize.
 - Rough compute-hours actually consumed to reach that point: ~20.6 GPU-hours on H100 (steps 0→~12,360) + ~11.9 GPU-hours on A100 80GB (steps ~12,360→15,510) ≈ **~32.5 GPU-hours of real compute**, spread across roughly 4 calendar days of wall-clock time — the gap between those two numbers is entirely preemption/capacity overhead, not compute cost.
 
 ## Lessons learned
@@ -51,13 +58,85 @@ This looks like a contradiction — H100 is ~2.3x faster in wall-clock throughpu
 - **GCP's billing-budget kill-switch is not a real-time safety mechanism.** Its Pub/Sub notifications lagged actual spend by hours to days (observed stuck at "$0.00" while real spend had already passed the $250 threshold and reached ~$266) — it's a backstop for the eventual case, not a guardrail for a tight budget. A self-tracked cost meter (GPU-hours × known SKU rate, computed independently of GCP's billing pipeline) would close this gap; it wasn't in place before this run, and is worth building before resuming.
 - **Multi-GPU DDP remains unvalidated in practice**, despite being implemented and code-reviewed (see the DDP/`torch.compile` ordering discussion in the codebase) — the entire real run was gated to a single GPU by GCP's global `GPUS_ALL_REGIONS` quota, which never moved past 1 despite repeated increase requests. The 8x wall-clock gap this created dwarfs every other inefficiency discussed above.
 
+## Multi-cloud model transfer
+
+Checkpoints are plain PyTorch files (`torch.save` / `torch.load`) with no cloud-specific dependency — they move freely between GCS, S3, and Azure Blob Storage. The packed dataset (`train_25b_packed.bin`, ~50GB) is equally portable. Both are now backed up in GCS (original) and Azure Blob Storage (copy); the commands below show how the transfer was done and how to resume training on a new cloud from either source.
+
+### Current checkpoint location
+
+| Store | Path | Contents |
+|---|---|---|
+| GCS (original) | `gs://YOUR_GCS_BUCKET/checkpoints/model_latest.pt` | Step 15,510 checkpoint (~14GB) |
+| GCS | `gs://YOUR_GCS_BUCKET/data/train_25b_packed.bin` | Packed 25B-token dataset (~50GB) |
+| Azure Blob | `https://ACCOUNT.blob.core.windows.net/CONTAINER/checkpoints/model_latest.pt` | Step 15,510 checkpoint (copy) |
+| Azure Blob | `https://ACCOUNT.blob.core.windows.net/CONTAINER/data/train_25b_packed.bin` | Packed dataset (copy) |
+
+### GCS → Azure Blob Storage (initial copy)
+
+```bash
+# Install tools
+pip install azure-storage-blob
+# Install azcopy: https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azcopy-v10
+
+export AZURE_STORAGE_ACCOUNT=yourstorageaccount
+export AZURE_CONTAINER=1bmodel
+export AZURE_RESOURCE_GROUP=yourresourcegroup
+
+# One-time: create Azure storage resources
+az group create --name $AZURE_RESOURCE_GROUP --location eastus
+az storage account create --name $AZURE_STORAGE_ACCOUNT \
+  --resource-group $AZURE_RESOURCE_GROUP --sku Standard_LRS
+az storage container create --name $AZURE_CONTAINER \
+  --account-name $AZURE_STORAGE_ACCOUNT --public-access off
+
+# Generate SAS token (write access, 24h)
+EXPIRY=$(date -u -v+1d '+%Y-%m-%dT%H:%MZ' 2>/dev/null || date -u -d '+1 day' '+%Y-%m-%dT%H:%MZ')
+SAS=$(az storage container generate-sas \
+  --account-name $AZURE_STORAGE_ACCOUNT \
+  --name $AZURE_CONTAINER \
+  --permissions rwl --expiry $EXPIRY --output tsv)
+BLOB_URL="https://$AZURE_STORAGE_ACCOUNT.blob.core.windows.net/$AZURE_CONTAINER"
+
+# Copy checkpoint from GCS to local, then upload to Azure
+# (run on a cloud VM to avoid home-connection egress)
+gcloud storage cp gs://YOUR_GCS_BUCKET/checkpoints/model_latest.pt ./model_latest.pt
+azcopy copy ./model_latest.pt "$BLOB_URL/checkpoints/model_latest.pt?$SAS"
+
+# Copy packed dataset (~50GB — needs disk space, or use --block-size-mb to stream)
+gcloud storage cp gs://YOUR_GCS_BUCKET/data/train_25b_packed.bin ./train_25b_packed.bin
+azcopy copy ./train_25b_packed.bin "$BLOB_URL/data/train_25b_packed.bin?$SAS"
+```
+
+### Resuming training on Azure
+
+Full Azure VM setup, quotas, and the training launch command are in **[docs/azure-deployment.md](docs/azure-deployment.md)**. The short version: use `Standard_NC24ads_A100_v4` (1×A100 80GB Spot, ~$0.679/hr) — the same `batch_size=8` config that ran on GCP fits exactly. Pull the checkpoint from Azure Blob at startup and pass `--resume_from ./model_latest.pt` with the same LR-schedule flags as the GCP run.
+
+### Resuming on GCP
+
+The checkpoint is already in GCS. Resize the existing MIG back to 1:
+
+```bash
+gcloud compute instance-groups managed resize my-train-mig --region=us-central1 --size=1
+```
+
+The startup script pulls the latest checkpoint automatically via `--auto_resume --gcs_bucket gs://YOUR_GCS_BUCKET/checkpoints`.
+
+### Checkpoint portability
+
+All three providers store plain PyTorch checkpoints. When resuming on any cloud:
+1. Pull `model_latest.pt` from whatever store is cheapest/fastest to access.
+2. Use **the exact same** `--max_steps 95367 --max_lr 3e-4 --min_lr 3e-5` as the GCP run — the cosine LR schedule is a pure function of these values, and any mismatch breaks schedule continuity.
+3. The data iterator resets to the beginning on every resume (no position saved) — acceptable for a 25B-token corpus where one epoch is nowhere near complete.
+
 ## Repo layout
 
 | File | Purpose |
 |---|---|
 | [model.py](model.py) | Model definition: `Transformer1B` (GQA attention, RoPE, SwiGLU FFN, RMSNorm, tied embeddings) |
-| [dataset.py](dataset.py) | `PretrainBinaryDataset` — streams fixed-length token chunks out of packed `.bin` shards, sharded per DDP rank |
-| [train.py](train.py) | Training loop: LR schedule, gradient accumulation, DDP, checkpointing |
+| [dataset.py](dataset.py) | `PretrainBinaryDataset` — streams fixed-length token chunks out of packed `.bin` shards, sharded per data-parallel rank |
+| [train.py](train.py) | Training loop: LR schedule, gradient accumulation, FSDP2 (multi-GPU) / plain single-GPU, checkpointing |
+| [sm_train.py](sm_train.py), [launch_sagemaker.py](launch_sagemaker.py) | AWS SageMaker entry point and job launcher — see [docs/aws-deployment.md](docs/aws-deployment.md) |
+| [requirements.txt](requirements.txt) | Training dependencies (`torch>=2.6` for FSDP2) |
 | [download_script.bash](download_script.bash) | Downloads the raw FineWeb-Edu parquet shards |
 | [prepare_data_local.py](prepare_data_local.py) | Tokenizes local parquet files and packs them into a single binary token shard |
 | [prepare_data_multiprocess.py](prepare_data_multiprocess.py) | Same idea, parallelized across CPU cores for faster tokenization |
@@ -139,7 +218,7 @@ This is the fastest way to catch a broken config, an OOM, or a data-pipeline bug
 
 ## 4. Run the full pretraining job on a GPU cluster
 
-`train.py` auto-detects DDP from the environment (`RANK` / `LOCAL_RANK` / `WORLD_SIZE`), so launch it with `torchrun`. Single node, 8 GPUs:
+`train.py` auto-detects a multi-process launch from the environment (`RANK` / `LOCAL_RANK` / `WORLD_SIZE`) and then shards the model with FSDP2 (`fully_shard`: parameters, gradients and Adam state are split across GPUs, so per-GPU memory shrinks as GPUs are added — unlike DDP, which replicates everything). Launch it with `torchrun`. Single node, 8 GPUs:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py \
@@ -178,8 +257,11 @@ Full CLI options:
 | `--weight_decay` | `0.1` | AdamW weight decay (only applied to ≥2D weights, not RMSNorm scales) |
 | `--save_interval` | `500` | Save `model_latest.pt` every N steps, in addition to the final checkpoint |
 | `--resume_from` | `None` | Path to a checkpoint to resume model + optimizer + step from |
-| `--auto_resume` | off | If `--resume_from` isn't given, look for `out_dir/model_latest.pt` locally, then `gs://<gcs_bucket>/model_latest.pt` if not found locally; starts fresh if neither exists |
-| `--gcs_bucket` | `None` | If set (e.g. `gs://bucket/checkpoints`), upload each checkpoint there via `gcloud storage cp` right after it saves locally |
+| `--auto_resume` | off | If `--resume_from` isn't given, look for `out_dir/model_latest.pt` locally, then `<remote_dir>/model_latest.pt` if not found locally; starts fresh if neither exists |
+| `--remote_dir` (alias `--gcs_bucket`) | `None` | If set (`gs://bucket/path` or `s3://bucket/path`), upload each checkpoint there (`gcloud storage cp` / `aws s3 cp`) right after it saves locally |
+| `--activation_checkpointing` | off | Recompute block activations in backward (~30% slower, much less activation memory) — lets a larger `--batch_size` fit on 24GB GPUs |
+| `--defer_grad_sync` | off | FSDP only: reduce-scatter gradients only on the last micro-step of each accumulation window (less communication, more memory) |
+| `--seed` | `1337` | Model-init seed; must match across ranks under FSDP |
 | `--compile` | off | Enable `torch.compile` |
 | `--wandb` | off | Log metrics to Weights & Biases |
 | `--wandb_project` | `1bmodel-pretrain` | W&B project name |
@@ -208,6 +290,10 @@ Both include `model_state_dict`, `optimizer_state_dict` (AdamW momentum/variance
 The full pipeline was validated end to end on real GCP GPU hardware (L4 → H100 → A100 40GB → A100 80GB) and is currently running the real 25B-token training job unattended on a preemptible A100 80GB, auto-recovering from preemptions via a Managed Instance Group, with a Cloud Billing budget kill-switch capping spend.
 
 For VM setup, IAM/OAuth scope gotchas, the smoke-test walkthrough, the MIG auto-recovery setup, the budget kill-switch, real GCP-vs-Azure pricing, and the GPU-selection lessons (why A100 40GB OOM'd where H100 and A100 80GB didn't) — see **[docs/gcp-deployment.md](docs/gcp-deployment.md)**.
+
+For running on AWS (SageMaker, 4× A10G `ml.g5.12xlarge`, FSDP2, Managed Spot Training with S3 checkpoints) — including one-time bucket/IAM/quota setup and moving the GCP checkpoint over — see **[docs/aws-deployment.md](docs/aws-deployment.md)**. Note: AWS credit was exhausted before a real GPU run was done; the SageMaker setup is complete and documented but untested on real hardware.
+
+For running on Azure (`Standard_NC24ads_A100_v4`, 1×A100 80GB Spot, ~$0.679/hr) — including storage account setup, copying checkpoints from GCS, and the VM startup script — see **[docs/azure-deployment.md](docs/azure-deployment.md)**.
 
 <p float="left">
   <img src="docs/images/wandb-h100-perf.png" width="45%" alt="W&B perf/tokens_per_sec chart from the H100 validation run" />
