@@ -10,15 +10,15 @@ The full architecture, parameter count, and memory/throughput derivation live in
 
 Measured across all real training runs, sourced from W&B (`1bmodel-pretrain`) and CloudWatch logs:
 
-| Cloud | GPU setup | Instance | Tok/s | Step time | MFU | Steps | Tokens | Compute | ~Cost |
-|---|---|---|---|---|---|---|---|---|---|
-| GCP | H100 80GB (no compile) | `a3-highgpu-1g` | ~43,700 | ~6.0 s | 31.4%† | 0→12,360 | 0→3.2B | ~20.6 h | ~$134 |
-| GCP | A100 80GB | `a2-ultragpu-1g` | ~19,210 | ~13.6 s | 44%‡ | 12,360→15,510 | 3.2B→4.1B | ~11.9 h | ~$35 |
-| GCP | A100 40GB | `a2-highgpu-1g` | ~12,900 | ~20.3 s | 29%‡ | OOM at batch≥4 | — | — | — |
-| AWS | 4×A10G FSDP2 | `ml.g5.12xlarge` | ~9,600 | ~27.1 s | 13.7%§ | preflight only | ~4.1B | 0.4 h | ~$3 |
-| AWS | 4×L4 FSDP2 | `ml.g6.12xlarge` | ~10,750 | ~24.4 s | 15.7% | 15,510→26,018 | 4.1B→6.8B | 72.1 h | ~$415 |
-| AWS | 4×L40S FSDP2 | `ml.g6e.12xlarge` | ~17,270 | ~15.2 s | 8.5% | 26,018→31,175 | 6.8B→8.2B | 22.2 h | ~$202 |
-| AWS | 1×L40S | `ml.g6e.8xlarge` | ~10,037 | ~6.5 s | 19.7% | 31,001→65,517 | 8.1B→10.4B‖ | 38.6 h¶ | ~$101 |
+| Cloud | GPU setup | Instance | Tok/s | Step time | MFU | Steps | Tokens | Compute | ~Cost | ¢/1M tok |
+|---|---|---|---|---|---|---|---|---|---|---|
+| GCP | H100 80GB (no compile) | `a3-highgpu-1g` | ~43,700 | ~6.0 s | 31.4%† | 0→12,360 | 0→3.2B | ~20.6 h | ~$134 | 4.2¢ |
+| GCP | A100 80GB | `a2-ultragpu-1g` | ~19,210 | ~13.6 s | 44%‡ | 12,360→15,510 | 3.2B→4.1B | ~11.9 h | ~$35 | 3.9¢ |
+| GCP | A100 40GB | `a2-highgpu-1g` | ~12,900 | ~20.3 s | 29%‡ | OOM at batch≥4 | — | — | — | — |
+| AWS | 4×A10G FSDP2 | `ml.g5.12xlarge` | ~9,600 | ~27.1 s | 13.7%§ | preflight only | ~4.1B | 0.4 h | ~$3 | — |
+| AWS | 4×L4 FSDP2 | `ml.g6.12xlarge` | ~10,750 | ~24.4 s | 15.7% | 15,510→26,018 | 4.1B→6.8B | 72.1 h | ~$415 | 15.4¢ |
+| AWS | 4×L40S FSDP2 | `ml.g6e.12xlarge` | ~17,270 | ~15.2 s | 8.5% | 26,018→31,175 | 6.8B→8.2B | 22.2 h | ~$202 | 14.4¢ |
+| AWS | 1×L40S | `ml.g6e.8xlarge` | ~10,037 | ~6.5 s | 19.7% | 31,001→65,517 | 8.1B→10.4B‖ | 38.6 h¶ | ~$101 | 4.4¢ |
 
 GCP config: `batch_size=8, grad_accum_steps=16, seq_len=2048`, single GPU, no activation checkpointing. AWS config: `batch_size=4, grad_accum_steps=8, seq_len=2048`, FSDP2, activation checkpointing on.
 
