@@ -6,7 +6,9 @@ The full architecture, parameter count, and memory/throughput derivation live in
 
 ## Results
 
-Measured on the real training run (config: `batch_size=8, grad_accum_steps=16, seq_len=2048` → 262,144 tokens/step; actual parameter count 1,185,204,224, not the design doc's rounded 1.24B), sourced from the project's W&B history (`1bmodel-pretrain`):
+**Training target:** 25B tokens — 95,367 steps at 262,144 tokens/step (`batch_size=8, grad_accum_steps=16, seq_len=2048`, 1 GPU equiv.). **Current position: step 65,517 / ~10.4B tokens consumed (~41.5% complete).** Actual parameter count 1,185,204,224 (design doc rounded to 1.24B).
+
+Measured across all real training runs, sourced from W&B (`1bmodel-pretrain`) and CloudWatch logs:
 
 | Cloud | GPU setup | Instance | Tok/s | Step time | MFU | Steps | Compute | ~Cost |
 |---|---|---|---|---|---|---|---|---|
