@@ -10,15 +10,15 @@ The full architecture, parameter count, and memory/throughput derivation live in
 
 Measured across all real training runs, sourced from W&B (`1bmodel-pretrain`) and CloudWatch logs:
 
-| Cloud | GPU setup | Instance | Tok/s | Step time | MFU | Steps | Tokens | Compute | ~Cost | ¢/1M tok |
-|---|---|---|---|---|---|---|---|---|---|---|
-| GCP | H100 80GB (no compile) | `a3-highgpu-1g` | ~43,700 | ~6.0 s | 31.4%† | 0→12,360 | 0→3.2B | ~20.6 h | ~$134 | 4.2¢ |
-| GCP | A100 80GB | `a2-ultragpu-1g` | ~19,210 | ~13.6 s | 44%‡ | 12,360→15,510 | 3.2B→4.1B | ~11.9 h | ~$35 | 3.9¢ |
-| GCP | A100 40GB | `a2-highgpu-1g` | ~12,900 | ~20.3 s | 29%‡ | OOM at batch≥4 | — | — | — | — |
-| AWS | 4×A10G FSDP2 | `ml.g5.12xlarge` | ~9,600 | ~27.1 s | 13.7%§ | preflight only | ~4.1B | 0.4 h | ~$3 | — |
-| AWS | 4×L4 FSDP2 | `ml.g6.12xlarge` | ~10,750 | ~24.4 s | 15.7% | 15,510→26,018 | 4.1B→6.8B | 72.1 h | ~$415 | 15.4¢ |
-| AWS | 4×L40S FSDP2 | `ml.g6e.12xlarge` | ~17,270 | ~15.2 s | 8.5% | 26,018→31,175 | 6.8B→8.2B | 22.2 h | ~$202 | 14.4¢ |
-| AWS | 1×L40S | `ml.g6e.8xlarge` | ~10,037 | ~6.5 s | 19.7% | 31,001→65,517 | 8.1B→10.4B‖ | 38.6 h¶ | ~$101 | 4.4¢ |
+| Cloud | GPU setup | Instance | Pricing | Tok/s | Step time | MFU | Steps | Tokens | Compute | ~Cost | ¢/1M tok |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| GCP | H100 80GB (no compile) | `a3-highgpu-1g` | Preemptible Spot | ~43,700 | ~6.0 s | 31.4%† | 0→12,360 | 0→3.2B | ~20.6 h | ~$134 | 4.2¢ |
+| GCP | A100 80GB | `a2-ultragpu-1g` | Preemptible Spot | ~19,210 | ~13.6 s | 44%‡ | 12,360→15,510 | 3.2B→4.1B | ~11.9 h | ~$35 | 3.9¢ |
+| GCP | A100 40GB | `a2-highgpu-1g` | Preemptible Spot | ~12,900 | ~20.3 s | 29%‡ | OOM at batch≥4 | — | — | — | — |
+| AWS | 4×A10G FSDP2 | `ml.g5.12xlarge` | On-demand | ~9,600 | ~27.1 s | 13.7%§ | preflight only | ~4.1B | 0.4 h | ~$3 | — |
+| AWS | 4×L4 FSDP2 | `ml.g6.12xlarge` | Managed Spot | ~10,750 | ~24.4 s | 15.7% | 15,510→26,018 | 4.1B→6.8B | 72.1 h | ~$415 | 15.4¢ |
+| AWS | 4×L40S FSDP2 | `ml.g6e.12xlarge` | Managed Spot | ~17,270 | ~15.2 s | 8.5% | 26,018→31,175 | 6.8B→8.2B | 22.2 h | ~$202 | 14.4¢ |
+| AWS | 1×L40S | `ml.g6e.8xlarge` | Managed Spot | ~10,037 | ~6.5 s | 19.7% | 31,001→65,517 | 8.1B→10.4B‖ | 38.6 h¶ | ~$101 | 4.4¢ |
 
 GCP config: `batch_size=8, grad_accum_steps=16, seq_len=2048`, single GPU, no activation checkpointing. AWS config: `batch_size=4, grad_accum_steps=8, seq_len=2048`, FSDP2, activation checkpointing on.
 
@@ -38,17 +38,22 @@ Peak TFLOPS per GPU: H100 989T · A100 312T · L40S 362T · L4 121.4T · A10G 12
 
 ### GPU selection: speed vs. cost
 
-Derived from the measured tok/s and actual hourly rates above. Remaining work: ~14.6B tokens (25B − 10.4B).
+Based on measured data only (actual runs). Remaining work: ~14.6B tokens (25B − 10.4B).
 
-Ranking by measured ¢/1M tok (actual runs only):
+| Category | Best choice | Pricing | Why |
+|---|---|---|---|
+| **Cheapest** | GCP A100 80GB | Preemptible Spot | 3.9¢/1M tok — lowest cost per token of all measured runs |
+| **Fastest** | GCP H100 80GB | Preemptible Spot | 43,700 tok/s — 2.3× faster wall-clock than A100 |
+| **Best availability** | AWS 1×L40S | Managed Spot | Less subject to GCP preemptible stockouts; on-demand also available |
+| **Best overall** | GCP A100 80GB | Preemptible Spot | Cheapest per token + highest MFU (44%) + no FSDP overhead |
 
-1. **GCP A100 80GB — 3.9¢/1M tok — best overall.** Highest sustained MFU (44%), no activation checkpointing overhead, single-GPU simplicity. Use this if GCP capacity is available.
-2. **GCP H100 80GB — 4.2¢/1M tok.** Nearly as cheap, 2.3× faster in wall-clock. Higher hourly cost but throughput nearly cancels it out. Choose over A100 only when time is the binding constraint.
-3. **AWS 1×L40S — 4.4¢/1M tok.** Comparable to GCP single-GPU runs; best fallback when GCP is unavailable.
-4. AWS 4×L40S FSDP2 — 14.4¢/1M tok — 3.7× more expensive per token; PCIe all-reduce overhead dominates.
-5. AWS 4×L4 FSDP2 — 15.4¢/1M tok — most expensive per token consumed.
-
-Estimated remaining cost for ~14.6B tokens: GCP A100 ~$568 (~211h at ~$2.94/hr) · GCP H100 ~$604 (~93h at ~$6.50/hr) · AWS 1×L40S ~$639 (~244h at ~$2.62/hr).
+| GPU | Pricing | ¢/1M tok | $/hr | Tok/s | Est. time (14.6B tok) | Est. cost |
+|---|---|---|---|---|---|---|
+| GCP A100 80GB | Preemptible Spot | 3.9¢ | ~$2.94 | ~19,210 | ~211h | ~$568 |
+| GCP H100 80GB | Preemptible Spot | 4.2¢ | ~$6.50 | ~43,700 | ~93h | ~$604 |
+| AWS 1×L40S | Managed Spot | 4.4¢ | ~$2.62 | ~10,037 | ~244h | ~$639 |
+| AWS 4×L40S FSDP2 | Managed Spot | 14.4¢ | ~$9.10/hr (4 GPUs) | ~17,270 | ~235h | ~$2,140 |
+| AWS 4×L4 FSDP2 | Managed Spot | 15.4¢ | ~$5.76/hr (4 GPUs) | ~10,750 | ~378h | ~$2,180 |
 
 **Why AWS MFU is lower than GCP:** two independent causes compound:
 - `activation_checkpointing=True` is required to fit the model on 24GB GPUs; it recomputes block activations in the backward pass (~30% extra FLOPs), reducing effective throughput.
@@ -95,12 +100,15 @@ Every additional GPU multiplies tok/step by `world_size`, which divides max_step
 - **Sequence length and batch shape changed** from the design's `seq_len=8192, batch=4` to the actually-run `seq_len=2048, batch_size=8, grad_accum_steps=16` — same order of tokens/step (262K vs the design's 257K), different shape, driven by the memory constraints below.
 - **Status: paused at step 65,517 (~41.5% of target tokens, ~10.4B/25B)**, loss ~2.78 at last AWS step. Training continued on AWS after GCP exhausted its credit budget, running through four different instance types (see table above and full AWS history in [docs/aws-deployment.md](docs/aws-deployment.md#training-history)). **Current checkpoint is in S3** (`s3://1b-model-pretraining/checkpoints/model_latest.pt`, ~13.6 GiB, saved Oct 5) **and is also backed up in GCS and Azure Blob Storage** (see [Multi-cloud model transfer](#multi-cloud-model-transfer)); resuming requires only running the launch command again.
 - Cumulative compute actually consumed:
-  - GCP H100 (steps 0→12,360): ~20.6 GPU-hours
-  - GCP A100 80GB (steps 12,360→15,510): ~11.9 GPU-hours
-  - AWS g6.12xlarge / 4×L4 (steps 15,510→26,018): ~72.1 GPU-hours billable (259,471s)
-  - AWS g6e.12xlarge / 4×L40S (steps 26,018→31,175): ~22.2 GPU-hours billable (79,824s)
-  - AWS g6e.8xlarge / 1×L40S (steps 31,001→65,517): ~38.6 GPU-hours billable (139,092s)
-  - **Total ≈ ~165 GPU-hours of billable compute**, ~10.4B tokens processed out of 25B target. Total spend ~$1,212 (GCP ~$266 + AWS $945.57).
+
+  | Run | GPU | Tokens | GPU-hours | Pricing |
+  |---|---|---|---|---|
+  | GCP `a3-highgpu-1g` | H100 80GB | 0→3.2B | ~20.6 h | Preemptible Spot |
+  | GCP `a2-ultragpu-1g` | A100 80GB | 3.2B→4.1B | ~11.9 h | Preemptible Spot |
+  | AWS `ml.g6.12xlarge` | 4×L4 | 4.1B→6.8B | ~72.1 h (259,471s) | Managed Spot |
+  | AWS `ml.g6e.12xlarge` | 4×L40S | 6.8B→8.2B | ~22.2 h (79,824s) | Managed Spot |
+  | AWS `ml.g6e.8xlarge` | 1×L40S | 8.1B→10.4B | ~38.6 h (139,092s) | Managed Spot |
+  | **Total** | | **~10.4B / 25B** | **~165 h** | **~$1,212** (GCP ~$266 + AWS $945.57) |
 
 ## Lessons learned
 
