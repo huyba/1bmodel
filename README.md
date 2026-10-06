@@ -38,7 +38,7 @@ Peak TFLOPS per GPU: H100 989T · A100 312T · L40S 362T · L4 121.4T · A10G 12
 
 ### GPU selection: speed vs. cost
 
-Based on measured data only (actual runs). Remaining work: ~14.6B tokens (25B − 10.4B).
+Based on measured data only (actual runs).
 
 | Category | Best choice | Pricing | Why |
 |---|---|---|---|
@@ -46,6 +46,8 @@ Based on measured data only (actual runs). Remaining work: ~14.6B tokens (25B �
 | **Fastest** | GCP H100 80GB | Preemptible Spot | 43,700 tok/s — 2.3× faster wall-clock than A100 |
 | **Best availability** | AWS 1×L40S | Managed Spot | Less subject to GCP preemptible stockouts; on-demand also available |
 | **Best overall** | GCP A100 80GB | Preemptible Spot | Cheapest per token + highest MFU (44%) + no FSDP overhead |
+
+Remaining work: ~14.6B tokens (25B − 10.4B).
 
 | GPU | Pricing | ¢/1M tok | $/hr | Tok/s | Est. time (14.6B tok) | Est. cost |
 |---|---|---|---|---|---|---|
