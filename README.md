@@ -1,6 +1,6 @@
-# 1B Dense Model — Toy Pretraining Pipeline
+# 1B Dense Model — Pretraining Pipeline
 
-A from-scratch pretraining pipeline for a ~1.24B parameter dense transformer (GQA + RoPE + SwiGLU + RMSNorm), trained on ~25B tokens sampled from [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu). It's a toy/learning project: the goal is to exercise the full stack of a real LLM pretraining run — data download, tokenization/packing, a hand-written model and training loop, and multi-GPU DDP — end to end on a small-enough model to actually finish training.
+A from-scratch pretraining pipeline for a ~1.24B parameter dense transformer (GQA + RoPE + SwiGLU + RMSNorm), trained on ~25B tokens sampled from [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu). The goal is to exercise the full stack of a real LLM pretraining run — data download, tokenization/packing, a hand-written model and training loop, and multi-GPU FSDP2 — end to end, across multiple cloud providers.
 
 The full architecture, parameter count, and memory/throughput derivation live in [design.md](design.md) (worked through by hand: ~1.24B params, ~12h estimated on 8×H100, batch/sequence-length sizing, etc.) — read that first if you want the reasoning behind the numbers used below.
 
@@ -8,19 +8,34 @@ The full architecture, parameter count, and memory/throughput derivation live in
 
 Measured on the real training run (config: `batch_size=8, grad_accum_steps=16, seq_len=2048` → 262,144 tokens/step; actual parameter count 1,185,204,224, not the design doc's rounded 1.24B), sourced from the project's W&B history (`1bmodel-pretrain`):
 
-| GPU | Peak BF16 | Measured MFU | Eff. throughput | Tok/s | Step time | Notes |
-|---|---|---|---|---|---|---|
-| H100 80GB (no `torch.compile`) | 989 TFLOPS | 31.5%† | ~311 TFLOPS | ~43,700 | ~6.0 s | GCP `a3-highgpu-1g`; steps 0→12,360 |
-| A100 80GB | 312 TFLOPS | 44% (avg 10 steps) | ~137 TFLOPS | ~19,210 | ~13.6 s | GCP `a2-ultragpu-1g`; **main training GPU** |
-| A100 40GB | 312 TFLOPS | 29.5%‡ | ~92 TFLOPS | ~12,900 | ~20.3 s | Forced `batch=1` (OOM at ≥4); impractical |
-| L4 24GB | 121.4 TFLOPS | ~7%§ | ~8.5 TFLOPS | ~1,200 | — | Smoke test only (`batch=1, seq=128`); not a real training run |
-| A10G 24GB ×4 (FSDP2) | 125 TFLOPS | — | — | — | — | AWS `ml.g5.12xlarge`; not run (credit exhausted) |
+| Cloud | GPU setup | Instance | Tok/s | Step time | MFU | Steps | Compute | ~Cost |
+|---|---|---|---|---|---|---|---|---|
+| GCP | H100 80GB (no compile) | `a3-highgpu-1g` | ~43,700 | ~6.0 s | 31.4%† | 0→12,360 | ~20.6 h | ~$134 |
+| GCP | A100 80GB | `a2-ultragpu-1g` | ~19,210 | ~13.6 s | 44%‡ | 12,360→15,510 | ~11.9 h | ~$35 |
+| GCP | A100 40GB | `a2-highgpu-1g` | ~12,900 | ~20.3 s | 29%‡ | OOM at batch≥4 | — | — |
+| AWS | 4×A10G FSDP2 | `ml.g5.12xlarge` | ~9,600 | ~27.1 s | 13.7%§ | preflight only | 0.4 h | ~$3 |
+| AWS | 4×L4 FSDP2 | `ml.g6.12xlarge` | ~10,750 | ~24.4 s | 15.7% | 15,510→26,018 | 72.1 h | ~$415 |
+| AWS | 4×L40S FSDP2 | `ml.g6e.12xlarge` | ~17,270 | ~15.2 s | 8.5% | 26,018→31,175 | 22.2 h | ~$202 |
+| AWS | 1×L40S | `ml.g6e.8xlarge` | ~10,037 | ~6.5 s | 19.7% | 31,001→65,517 | 38.6 h¶ | ~$101 |
 
-† H100 runs predate the `perf/mfu` W&B field — computed post hoc from the same formula (`6 × params × tok/s / peak_TFLOPS`) applied to logged `tokens/sec`.
+GCP config: `batch_size=8, grad_accum_steps=16, seq_len=2048`, single GPU, no activation checkpointing. AWS config: `batch_size=4, grad_accum_steps=8, seq_len=2048`, FSDP2, activation checkpointing on.
 
-‡ A100 40GB MFU is from [docs/gcp-deployment.md](docs/gcp-deployment.md#mfu-tracking); `batch=1` was the only config that fit in 40GB after `batch=8` and `batch=4` both OOM'd.
+**Total spend: ~$1,212** — GCP ~$266 (preemptible, hit kill-switch) + AWS **$945.57** (compute ~$734 + S3/transfer/CloudWatch ~$212). AWS breakdown from Cost Explorer: ml.g6.12xlarge ~$390, ml.g6e.12xlarge Spot ~$285, ml.g6e.8xlarge Spot ~$215, preflight/smoke/other ~$56.
 
-§ L4 throughput is from a 5-step smoke test at a toy config (`batch=1, seq_len=128`) — not a real training run at the standard `batch=8, seq_len=2048` shape. MFU = `6 × 1.185B × 1200 / (121.4T)` ≈ 7% confirms the L4 is compute-bound by the tiny batch, not a meaningful ceiling estimate. L4 peak bf16 dense: 121.4 TFLOPS.
+Peak TFLOPS per GPU: H100 989T · A100 312T · L40S 362T · L4 121.4T · A10G 125T. MFU formula: `6 × params × tok/s / system_peak_TFLOPS`.
+
+† H100 MFU computed post hoc (no `perf/mfu` W&B field in early runs).
+
+‡ A100 40GB forced to `batch=1` after `batch=8` and `batch=4` both OOM'd; impractical for this workload.
+
+§ A10G: preflight only (<10 steps); MFU representative but not from a sustained run.
+
+¶ g6e.8xlarge: 38.6 h billable (Spot) / 63.9 h wall-clock (includes capacity wait time). AWS compute costs sourced from SageMaker pricing API + EC2 Spot price history (us-west-2, Sep 27–Oct 5 2026). GCP rates from Cloud Billing Catalog API.
+
+**Why AWS MFU is lower than GCP:** two independent causes compound:
+- `activation_checkpointing=True` is required to fit the model on 24GB GPUs; it recomputes block activations in the backward pass (~30% extra FLOPs), reducing effective throughput.
+- `batch_size=4` (vs GCP's 8) means less GPU occupancy per step.
+- For 4-GPU FSDP2 with no NVLink (PCIe only on these instances), communication overhead is large — parallel efficiency measured at ~43% (17,270 / (4 × 10,037) = 1.72× speedup vs ideal 4×), which is why 1×L40S achieves higher MFU than 4×L40S despite needing fewer resources.
 
 W&B charts from the A100 80GB run (steps ~15,510-15,590, the last stretch before the pause described below) — `perf/tokens_per_sec` and `perf/mfu` track each other exactly, as expected since MFU is just tokens/sec rescaled by a constant:
 
@@ -47,8 +62,14 @@ This looks like a contradiction — H100 is ~2.3x faster in wall-clock throughpu
 - **DDP was never exercised.** This project's `GPUS_ALL_REGIONS` quota stayed capped at 1 for the entire run (see [docs/gcp-deployment.md](docs/gcp-deployment.md)), so every step of real training ran on a single GPU, not the 8 the design assumed. That alone is roughly an 8x wall-clock penalty independent of any per-GPU efficiency.
 - **Per-GPU efficiency landed close to plan.** Design assumed MFU=0.45 on H100; measured MFU on A100 (44%) came in almost exactly on target, and H100 (31.5%, uncompiled) is the outlier explained above, not a modeling error.
 - **Sequence length and batch shape changed** from the design's `seq_len=8192, batch=4` to the actually-run `seq_len=2048, batch_size=8, grad_accum_steps=16` — same order of tokens/step (262K vs the design's 257K), different shape, driven by the memory constraints below.
-- **Status: paused at step 15,510 / 95,367 (~16.3% of target tokens)**, loss ~2.31 (down from the expected fresh-init ~11 = -ln(1/64K)). It is not stopped due to a training bug — it's paused because of infrastructure/cost economics: a multi-day `ZONE_RESOURCE_POOL_EXHAUSTED` stretch on A100 80GB preemptible capacity in `us-central1-a` turned into a preempt→resume→preempt loop that made minimal net progress per wall-clock hour, spend had already reached ~$266 (past the $250 kill-switch threshold). AWS SageMaker was set up as a fallback (see [docs/aws-deployment.md](docs/aws-deployment.md)) but the AWS credit was exhausted before the first real GPU run. **Checkpoint and packed dataset are now backed up in both GCS and Azure Blob Storage** (see [Multi-cloud model transfer](#multi-cloud-model-transfer) below); next training will resume on Azure or GCP when credit is available — resuming on GCP is a one-line MIG resize.
-- Rough compute-hours actually consumed to reach that point: ~20.6 GPU-hours on H100 (steps 0→~12,360) + ~11.9 GPU-hours on A100 80GB (steps ~12,360→15,510) ≈ **~32.5 GPU-hours of real compute**, spread across roughly 4 calendar days of wall-clock time — the gap between those two numbers is entirely preemption/capacity overhead, not compute cost.
+- **Status: paused at step 65,517 (~41.5% of target tokens, ~10.4B/25B)**, loss ~2.78 at last AWS step. Training continued on AWS after GCP exhausted its credit budget, running through four different instance types (see table above and full AWS history in [docs/aws-deployment.md](docs/aws-deployment.md#training-history)). **Current checkpoint is in S3** (`s3://1b-model-pretraining/checkpoints/model_latest.pt`, ~13.6 GiB, saved Oct 5) **and is also backed up in GCS and Azure Blob Storage** (see [Multi-cloud model transfer](#multi-cloud-model-transfer)); resuming requires only running the launch command again.
+- Cumulative compute actually consumed:
+  - GCP H100 (steps 0→12,360): ~20.6 GPU-hours
+  - GCP A100 80GB (steps 12,360→15,510): ~11.9 GPU-hours
+  - AWS g6.12xlarge / 4×L4 (steps 15,510→26,018): ~72.1 GPU-hours billable (259,471s)
+  - AWS g6e.12xlarge / 4×L40S (steps 26,018→31,175): ~22.2 GPU-hours billable (79,824s)
+  - AWS g6e.8xlarge / 1×L40S (steps 31,001→65,517): ~38.6 GPU-hours billable (139,092s)
+  - **Total ≈ ~165 GPU-hours of billable compute**, ~10.4B tokens processed out of 25B target. Total spend ~$1,212 (GCP ~$266 + AWS $945.57).
 
 ## Lessons learned
 
@@ -66,10 +87,24 @@ Checkpoints are plain PyTorch files (`torch.save` / `torch.load`) with no cloud-
 
 | Store | Path | Contents |
 |---|---|---|
-| GCS (original) | `gs://YOUR_GCS_BUCKET/checkpoints/model_latest.pt` | Step 15,510 checkpoint (~14GB) |
+| **S3 (primary / latest)** | `s3://1b-model-pretraining/checkpoints/model_latest.pt` | **Step 65,517** checkpoint (~13.6 GiB, saved Oct 5 2026) |
+| S3 | `s3://1b-model-pretraining/train_25b_packed.bin` | Packed 25B-token dataset (~50GB) |
+| GCS | `gs://YOUR_GCS_BUCKET/checkpoints/model_latest.pt` | Step 15,510 checkpoint (GCP-era backup) |
 | GCS | `gs://YOUR_GCS_BUCKET/data/train_25b_packed.bin` | Packed 25B-token dataset (~50GB) |
-| Azure Blob | `https://ACCOUNT.blob.core.windows.net/CONTAINER/checkpoints/model_latest.pt` | Step 15,510 checkpoint (copy) |
+| Azure Blob | `https://ACCOUNT.blob.core.windows.net/CONTAINER/checkpoints/model_latest.pt` | Step 15,510 checkpoint (copy of GCP-era) |
 | Azure Blob | `https://ACCOUNT.blob.core.windows.net/CONTAINER/data/train_25b_packed.bin` | Packed dataset (copy) |
+
+**To get the latest checkpoint (step 65,517) from S3 to GCS or Azure, run:**
+
+```bash
+# S3 → GCS (update the GCS backup to the latest step)
+aws s3 cp s3://1b-model-pretraining/checkpoints/model_latest.pt - \
+  | gcloud storage cp - gs://YOUR_GCS_BUCKET/checkpoints/model_latest.pt
+
+# S3 → Azure Blob (update the Azure backup)
+aws s3 cp s3://1b-model-pretraining/checkpoints/model_latest.pt ./model_latest.pt
+azcopy copy ./model_latest.pt "https://ACCOUNT.blob.core.windows.net/CONTAINER/checkpoints/model_latest.pt?SAS"
+```
 
 ### GCS → Azure Blob Storage (initial copy)
 
@@ -291,7 +326,7 @@ The full pipeline was validated end to end on real GCP GPU hardware (L4 → H100
 
 For VM setup, IAM/OAuth scope gotchas, the smoke-test walkthrough, the MIG auto-recovery setup, the budget kill-switch, real GCP-vs-Azure pricing, and the GPU-selection lessons (why A100 40GB OOM'd where H100 and A100 80GB didn't) — see **[docs/gcp-deployment.md](docs/gcp-deployment.md)**.
 
-For running on AWS (SageMaker, 4× A10G `ml.g5.12xlarge`, FSDP2, Managed Spot Training with S3 checkpoints) — including one-time bucket/IAM/quota setup and moving the GCP checkpoint over — see **[docs/aws-deployment.md](docs/aws-deployment.md)**. Note: AWS credit was exhausted before a real GPU run was done; the SageMaker setup is complete and documented but untested on real hardware.
+For running on AWS (SageMaker, 4× A10G `ml.g5.12xlarge`, FSDP2, Managed Spot Training with S3 checkpoints) — including one-time bucket/IAM/quota setup and moving the GCP checkpoint over — see **[docs/aws-deployment.md](docs/aws-deployment.md)**. Note: AWS credit ($945.57 total) is now exhausted after real training runs across g5/g6/g6e instances — see [docs/aws-deployment.md](docs/aws-deployment.md#training-history) for the full job history.
 
 For running on Azure (`Standard_NC24ads_A100_v4`, 1×A100 80GB Spot, ~$0.679/hr) — including storage account setup, copying checkpoints from GCS, and the VM startup script — see **[docs/azure-deployment.md](docs/azure-deployment.md)**.
 
