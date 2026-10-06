@@ -46,7 +46,14 @@ Derived from the measured tok/s and actual hourly rates above. Remaining work: ~
 | **Cheapest** | A100 80GB (Azure Spot) | ~19,210 | ~$0.68 | ~$10 | **~$143 (~211h)** |
 | **Best overall** | A100 80GB (Azure Spot) | ~19,210 | ~$0.68 | ~$10 | ~$143 (~211h) |
 
-**Azure Spot A100 80GB is the clear winner on cost** — same GPU as the GCP A100 run (identical throughput and MFU ~44%), but ~4× cheaper per hour and ~4× cheaper per billion tokens than GCP preemptible. The H100 finishes 2.3× faster in wall-clock but costs ~4× more in total; only choose it if time is the binding constraint. The AWS L40S options (~$73–149/B tokens) were the most expensive per token consumed — a combination of PCIe FSDP overhead, activation checkpointing, and smaller per-GPU batches.
+**Measured ranking (actual runs, cheapest first):**
+1. **GCP A100 80GB — 3.9¢/1M tok** — best overall; use this if available. Highest sustained MFU (44%), no activation checkpointing overhead, single-GPU simplicity.
+2. **GCP H100 80GB — 4.2¢/1M tok** — nearly as cheap, 2.3× faster in wall-clock. Higher hourly cost but throughput advantage nearly cancels it out. Choose over A100 only when time is the constraint.
+3. **AWS 1×L40S — 4.4¢/1M tok** — comparable to GCP single-GPU runs; reasonable fallback when GCP capacity is unavailable.
+4. AWS 4×L40S FSDP2 — 14.4¢/1M tok — 3.7× more expensive per token; PCIe all-reduce overhead dominates.
+5. AWS 4×L4 FSDP2 — 15.4¢/1M tok — most expensive per token consumed; high hourly cost relative to throughput.
+
+**For future runs**, Azure Spot A100 80GB (~$0.68/hr) is projected to be ~4× cheaper per hour than GCP preemptible A100 (~$2.94/hr) with identical throughput — estimated ~$143 for the remaining ~14.6B tokens. Checkpoint is already in Azure Blob Storage; see [docs/azure-deployment.md](docs/azure-deployment.md).
 
 **Why AWS MFU is lower than GCP:** two independent causes compound:
 - `activation_checkpointing=True` is required to fit the model on 24GB GPUs; it recomputes block activations in the backward pass (~30% extra FLOPs), reducing effective throughput.
